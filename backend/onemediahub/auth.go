@@ -24,18 +24,22 @@ import (
 )
 
 const (
-	o2URL           = "https://cloud.o2online.es"
-	o2AuthURL       = "https://apiseg.telefonica.es/openid/connect/auth/oauth/v2/o2/cus/authorize"
-	o2TokenURL      = "https://apiseg.telefonica.es/openid/connect/auth/oauth/v2/o2/cus/token"
-	o2RedirectURL   = o2URL + "/ui/html/clientoauth.html"
-	authOAuth       = "oauth"
-	authPassword    = "password"
-	authStateKey    = "config_auth_state"
-	authVerifierKey = "config_auth_verifier"
-	credentialsKey  = "oauth_credentials"
-	sessionKey      = "session"
-	oauthPrefix     = "oauth "
-	invalidKeyCode  = "SEC-1003"
+	o2URL                = "https://cloud.o2online.es"
+	o2AuthURL            = "https://apiseg.telefonica.es/openid/connect/auth/oauth/v2/o2/cus/authorize"
+	o2TokenURL           = "https://apiseg.telefonica.es/openid/connect/auth/oauth/v2/o2/cus/token"
+	o2RedirectURL        = o2URL + "/ui/html/clientoauth.html"
+	o2GermanyURL         = "https://cloud.o2.de"
+	o2GermanyAuthURL     = "https://mondia-lcm.o2online.de/v2/web/auth/dialog/oauth"
+	o2GermanyTokenURL    = "https://police.mondiamedia.com/v2/api/auth/token"
+	o2GermanyRedirectURL = o2GermanyURL + "/ui/html/clientoauth.html"
+	authOAuth            = "oauth"
+	authPassword         = "password"
+	authStateKey         = "config_auth_state"
+	authVerifierKey      = "config_auth_verifier"
+	credentialsKey       = "oauth_credentials"
+	sessionKey           = "session"
+	oauthPrefix          = "oauth "
+	invalidKeyCode       = "SEC-1003"
 )
 
 func (o *options) oauthConfig() (*oauth2.Config, error) {
@@ -52,18 +56,26 @@ func (o *options) oauthConfig() (*oauth2.Config, error) {
 		Endpoint:    oauth2.Endpoint{AuthURL: o.AuthURL, TokenURL: o.TokenURL},
 		RedirectURL: o.RedirectURL, Scopes: strings.Fields(o.Scope),
 	}
-	if strings.TrimRight(o.URL, "/") == o2URL {
-		if c.Endpoint.AuthURL == "" {
-			c.Endpoint.AuthURL = o2AuthURL
+	var authURL, tokenURL, redirectURL string
+	switch strings.TrimRight(o.URL, "/") {
+	case o2URL:
+		authURL, tokenURL, redirectURL = o2AuthURL, o2TokenURL, o2RedirectURL
+		if o.Scope == "" {
+			c.Scopes = []string{"openid"}
 		}
+	case o2GermanyURL:
+		authURL, tokenURL, redirectURL = o2GermanyAuthURL, o2GermanyTokenURL, o2GermanyRedirectURL
+	}
+	if c.Endpoint.AuthURL == "" {
+		c.Endpoint.AuthURL = authURL
+	}
 
-		if c.Endpoint.TokenURL == "" {
-			c.Endpoint.TokenURL = o2TokenURL
-		}
+	if c.Endpoint.TokenURL == "" {
+		c.Endpoint.TokenURL = tokenURL
+	}
 
-		if c.RedirectURL == "" {
-			c.RedirectURL = o2RedirectURL
-		}
+	if c.RedirectURL == "" {
+		c.RedirectURL = redirectURL
 	}
 	return c, nil
 }
@@ -109,8 +121,11 @@ func configure(ctx context.Context, name string, m configmap.Mapper, in fs.Confi
 		m.Set(authStateKey, state)
 		m.Set(authVerifierKey, verifier)
 		args := []oauth2.AuthCodeOption{oauth2.AccessTypeOffline, oauth2.S256ChallengeOption(verifier)}
-		if strings.TrimRight(opt.URL, "/") == o2URL {
+		switch strings.TrimRight(opt.URL, "/") {
+		case o2URL:
 			args = append(args, oauth2.SetAuthURLParam("acr_values", "2"))
+		case o2GermanyURL:
+			args = append(args, oauth2.SetAuthURLParam("client_type", "omh"))
 		}
 		loginURL := c.AuthCodeURL(state, args...)
 		out, err := fs.ConfigInput("exchange", "config_callback", "Open this URL and sign in, then paste the complete final URL from your browser:\n\n"+loginURL)
@@ -200,7 +215,7 @@ func (a *auth) scope() string {
 func (a *auth) restoreSession() {
 	raw, _ := a.m.Get(sessionKey)
 	var saved storedSession
-	if json.Unmarshal([]byte(raw), &saved) == nil && saved.Scope == a.scope() && saved.ID != "" && saved.Key != "" {
+	if json.Unmarshal([]byte(raw), &saved) == nil && saved.Scope == a.scope() && saved.ID != "" {
 		a.session = saved.Session
 	}
 }
@@ -258,7 +273,15 @@ func (a *auth) saveHeaderLocked(header string) error {
 		return errors.New("invalid SAPI OAuth response JSON")
 	}
 	var access, refresh string
-	if json.Unmarshal(envelope.Data["accesstoken"], &access) != nil || access == "" {
+	if json.Unmarshal(envelope.Data["accesstoken"], &access) != nil {
+		return errors.New("SAPI OAuth response has no access token")
+	}
+	// O2 clients retain the current token when SAPI sends an empty replacement.
+	if access == "" && a.token != nil {
+		access = a.token.AccessToken
+	}
+
+	if access == "" {
 		return errors.New("SAPI OAuth response has no access token")
 	}
 	token := &oauth2.Token{AccessToken: access, TokenType: "Bearer"}
@@ -430,8 +453,8 @@ func (a *auth) login(ctx context.Context) error {
 		return fmt.Errorf("decode login: %w", err)
 	}
 
-	if session.ID == "" || session.Key == "" {
-		return errors.New("login response has no session or validation key")
+	if session.ID == "" {
+		return errors.New("login response has no session ID")
 	}
 	a.session = session
 	return a.saveSession()

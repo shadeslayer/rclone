@@ -253,13 +253,59 @@ func TestConfigOAuth(t *testing.T) {
 	assert.Equal(t, "refresh", token.RefreshToken)
 }
 
+func TestProviderOAuth(t *testing.T) {
+	for _, tc := range []struct {
+		name, server, authURL, tokenURL, scope, param, value string
+	}{
+		{"Spain", "https://cloud.o2online.es", "https://apiseg.telefonica.es/openid/connect/auth/oauth/v2/o2/cus/authorize", "https://apiseg.telefonica.es/openid/connect/auth/oauth/v2/o2/cus/token", "openid", "acr_values", "2"},
+		{"Germany", "https://cloud.o2.de", "https://mondia-lcm.o2online.de/v2/web/auth/dialog/oauth", "https://police.mondiamedia.com/v2/api/auth/token", "", "client_type", "omh"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := testConfig(t, configmap.Simple{"url": tc.server + "/", "client_id": "registered-client"})
+			opt, err := readOptions(m)
+			require.NoError(t, err)
+			c, err := opt.oauthConfig()
+			require.NoError(t, err)
+			assert.Equal(t, tc.authURL, c.Endpoint.AuthURL)
+			assert.Equal(t, tc.tokenURL, c.Endpoint.TokenURL)
+			assert.Equal(t, tc.server+"/ui/html/clientoauth.html", c.RedirectURL)
+			assert.Equal(t, tc.scope, strings.Join(c.Scopes, " "))
+			out, err := configure(context.Background(), "test", m, fs.ConfigIn{State: "authorize"})
+			require.NoError(t, err)
+			u, err := url.Parse(strings.Split(out.Option.Help, "\n\n")[1])
+			require.NoError(t, err)
+			assert.Equal(t, tc.value, u.Query().Get(tc.param))
+			assert.Equal(t, "registered-client", u.Query().Get("client_id"))
+			assert.Equal(t, tc.scope, u.Query().Get("scope"))
+			assert.Equal(t, "S256", u.Query().Get("code_challenge_method"))
+
+			opt.AuthURL, opt.TokenURL, opt.RedirectURL = "https://custom/auth", "https://custom/token", "https://custom/callback"
+			opt.Scope = "custom offline"
+			c, err = opt.oauthConfig()
+			require.NoError(t, err)
+			assert.Equal(t, opt.AuthURL, c.Endpoint.AuthURL)
+			assert.Equal(t, opt.TokenURL, c.Endpoint.TokenURL)
+			assert.Equal(t, opt.RedirectURL, c.RedirectURL)
+			assert.Equal(t, []string{"custom", "offline"}, c.Scopes)
+		})
+	}
+}
+
 func TestIntegration(t *testing.T) {
 	fstests.Run(t, &fstests.Opt{RemoteName: "TestOneMediaHub:", NilObject: (*Object)(nil)})
 }
 
-// fixture implements the documented wire protocol and keeps binary data separately.
+type fixtureMode int
+
+const (
+	specMode fixtureMode = iota
+	o2Mode
+)
+
+// fixture models SAPI 14.5, with separately enabled O2 compatibility behavior.
 type fixture struct {
 	mu           sync.Mutex
+	mode         fixtureMode
 	pendingReads int
 	folders      []api.Folder
 	media        []api.Media
@@ -270,7 +316,7 @@ type fixture struct {
 
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
-	fx := &fixture{content: map[api.ID]string{}, nextID: 1}
+	fx := &fixture{folders: []api.Folder{}, media: []api.Media{}, content: map[api.ID]string{}, nextID: 1}
 	fx.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fx.serve(t, w, r) }))
 	t.Cleanup(fx.server.Close)
 	return fx
@@ -279,12 +325,13 @@ func newFixture(t *testing.T) *fixture {
 func (fx *fixture) serve(t *testing.T, w http.ResponseWriter, r *http.Request) {
 	fx.mu.Lock()
 	defer fx.mu.Unlock()
-	if r.URL.Query().Get("offset") == "0" {
+	if fx.mode == o2Mode && r.URL.Query().Get("offset") == "0" {
 		jsonReply(t, w, map[string]any{"error": map[string]string{"code": "COM-1021", "message": "Invalid offset"}})
 		return
 	}
 
 	if r.URL.Path == "/sapi/system/information" {
+		assert.Equal(t, http.MethodGet, r.Method)
 		jsonReply(t, w, map[string]string{"sapiversion": "14.5"})
 		return
 	}
@@ -297,6 +344,7 @@ func (fx *fixture) serve(t *testing.T, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/sapi/login" {
+		assert.Equal(t, http.MethodPost, r.Method)
 		jsonReply(t, w, map[string]any{"data": map[string]string{"jsessionid": "session", "validationkey": "key"}})
 		return
 	}
@@ -310,41 +358,60 @@ func (fx *fixture) serve(t *testing.T, w http.ResponseWriter, r *http.Request) {
 	action := r.URL.Query().Get("action")
 	switch {
 	case r.URL.Path == "/sapi/media/folder" && action == "get":
+		assert.Equal(t, http.MethodGet, r.Method)
 		offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 		end := min(offset+limit, len(fx.folders))
 		jsonReply(t, w, map[string]any{"data": map[string]any{"folders": fx.folders[min(offset, end):end]}})
 	case r.URL.Path == "/sapi/media/folder" && action == "save":
+		assert.Equal(t, http.MethodPost, r.Method)
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&envelope))
-		var folder api.Folder
-		require.NoError(t, json.Unmarshal(envelope.Data, &folder))
+		// §5.21 requires a name and numeric parent ID, without an ID on creation.
+		var data struct {
+			ID       json.RawMessage `json:"id"`
+			Name     string          `json:"name"`
+			ParentID *int64          `json:"parentid"`
+		}
+		require.NoError(t, json.Unmarshal(envelope.Data, &data))
+		assert.Empty(t, data.ID)
+		require.NotEmpty(t, data.Name)
+		folder := api.Folder{Name: data.Name, Status: "U", Date: time.Now().UnixMilli()}
+		if data.ParentID != nil {
+			folder.ParentID = api.ID(strconv.FormatInt(*data.ParentID, 10))
+		}
 		folder.ID = api.ID(strconv.Itoa(fx.nextID))
 		fx.nextID++
 		fx.folders = append(fx.folders, folder)
 		jsonReply(t, w, map[string]any{"id": folder.ID, "success": "Folder saved successfully"})
 	case r.URL.Path == "/sapi/media/folder" && action == "delete":
+		assert.Equal(t, http.MethodPost, r.Method)
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&envelope))
 		var data struct {
-			Folders []api.ID `json:"folders"`
+			Folders []int64 `json:"folders"`
 		}
 		require.NoError(t, json.Unmarshal(envelope.Data, &data))
 		require.Len(t, data.Folders, 1)
 		for i, folder := range fx.folders {
-			if folder.ID == data.Folders[0] {
+			if string(folder.ID) == strconv.FormatInt(data.Folders[0], 10) {
 				fx.folders = append(fx.folders[:i], fx.folders[i+1:]...)
 				break
 			}
 		}
 	case r.URL.Path == "/sapi/media" && action == "get":
+		assert.Equal(t, http.MethodPost, r.Method)
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&envelope))
 		var data struct {
-			IDs []api.ID `json:"ids"`
+			IDs    []int64  `json:"ids"`
+			Fields []string `json:"fields"`
 		}
 		require.NoError(t, json.Unmarshal(envelope.Data, &data))
+		assert.Subset(t, data.Fields, []string{"name", "size", "modificationdate", "url", "folderid"})
 		items := fx.media
 		more := false
 		if data.IDs != nil {
-			items = nil
+			assert.NotContains(t, r.URL.Query(), "limit", "§3.5.48 forbids pagination with IDs")
+			assert.NotContains(t, r.URL.Query(), "offset")
+			items = []api.Media{}
 			if fx.pendingReads > 0 {
 				fx.pendingReads--
 				jsonReply(t, w, map[string]any{"data": map[string]any{"media": []api.Media{}}})
@@ -352,7 +419,7 @@ func (fx *fixture) serve(t *testing.T, w http.ResponseWriter, r *http.Request) {
 			}
 			for _, item := range fx.media {
 				for _, id := range data.IDs {
-					if id == item.ID {
+					if strconv.FormatInt(id, 10) == string(item.ID) {
 						items = append(items, item)
 					}
 				}
@@ -364,17 +431,40 @@ func (fx *fixture) serve(t *testing.T, w http.ResponseWriter, r *http.Request) {
 			more = end < len(items)
 			items = items[min(offset, end):end]
 		}
-		jsonReply(t, w, map[string]any{"data": map[string]any{"media": items, "more": more}})
+		payload := map[string]any{"media": items}
+		result := map[string]any{"data": payload}
+		if data.IDs == nil {
+			if fx.mode == o2Mode {
+				payload["more"] = more
+			} else {
+				result["more"] = more
+			}
+		}
+		jsonReply(t, w, result)
 	case (r.URL.Path == "/sapi/upload" || r.URL.Path == "/sapi/upload/file") && action == "save":
+		assert.Equal(t, http.MethodPost, r.Method)
 		if err := r.ParseMultipartForm(1 << 20); err != nil {
 			http.Error(w, "invalid upload", http.StatusBadRequest)
 			return
 		}
 		defer func() { assert.NoError(t, r.MultipartForm.RemoveAll()) }()
 		require.NoError(t, json.Unmarshal([]byte(r.FormValue("data")), &envelope))
-		var data api.Upload
+		// §5.59 uses a string media ID, numeric folder ID/size and RFC 2445 dates.
+		var data struct {
+			ID          string `json:"id"`
+			FolderID    *int64 `json:"folderid"`
+			Name        string `json:"name"`
+			Size        int64  `json:"size"`
+			ContentType string `json:"contenttype"`
+			Created     string `json:"creationdate"`
+			Modified    string `json:"modificationdate"`
+		}
 		require.NoError(t, json.Unmarshal(envelope.Data, &data))
-		if strings.HasPrefix(data.Name, ".") {
+		require.NotEmpty(t, data.Name)
+		require.NotEmpty(t, data.ContentType)
+		_, err := time.Parse("20060102T150405Z", data.Created)
+		require.NoError(t, err)
+		if fx.mode == o2Mode && strings.HasPrefix(data.Name, ".") {
 			jsonReply(t, w, map[string]any{"error": map[string]string{"code": "COM-1011", "message": "Missing name"}})
 			return
 		}
@@ -390,14 +480,22 @@ func (fx *fixture) serve(t *testing.T, w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, data.Name, header.Filename)
 		id := api.ID(data.ID)
 		if id == "" {
+			assert.Equal(t, "/sapi/upload", r.URL.Path)
 			id = api.ID(strconv.Itoa(fx.nextID))
 			fx.nextID++
 		} else {
 			assert.Equal(t, "/sapi/upload/file", r.URL.Path)
 		}
-		modified, err := time.Parse(dateFormat, data.Modified)
+		modified, err := time.Parse("20060102T150405Z", data.Modified)
 		require.NoError(t, err)
-		item := api.Media{ID: id, FolderID: data.FolderID, Name: data.Name, Size: data.Size, Modified: modified.UnixMilli(), URL: fx.server.URL + "/content/" + string(id), Type: "file", Status: "U"}
+		name := data.Name
+		if fx.mode == o2Mode {
+			name = strings.TrimRight(name, ".")
+		}
+		item := api.Media{ID: id, Name: name, Size: data.Size, Modified: modified.UnixMilli(), URL: fx.server.URL + "/content/" + string(id), Type: "file", Status: "U"}
+		if data.FolderID != nil {
+			item.FolderID = api.ID(strconv.FormatInt(*data.FolderID, 10))
+		}
 		index := len(fx.media)
 		for i, existing := range fx.media {
 			if existing.ID == id {
@@ -413,23 +511,24 @@ func (fx *fixture) serve(t *testing.T, w http.ResponseWriter, r *http.Request) {
 		fx.content[id] = string(content)
 		jsonReply(t, w, map[string]any{"id": id, "success": "Media uploaded successfully"})
 	case r.URL.Path == "/sapi/media/file" && action == "delete":
+		assert.Equal(t, http.MethodPost, r.Method)
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&envelope))
 		var data struct {
-			Files      []api.ID `json:"files"`
-			SoftDelete bool     `json:"softdelete"`
+			Files []int64 `json:"files"`
 		}
 		require.NoError(t, json.Unmarshal(envelope.Data, &data))
 		assert.Equal(t, "true", r.URL.Query().Get("softdelete"))
 		for _, id := range data.Files {
 			for i, item := range fx.media {
-				if item.ID == id {
+				if string(item.ID) == strconv.FormatInt(id, 10) {
 					fx.media = append(fx.media[:i], fx.media[i+1:]...)
-					delete(fx.content, id)
+					delete(fx.content, item.ID)
 					break
 				}
 			}
 		}
 	case r.URL.Path == "/sapi/media" && action == "get-storage-space":
+		assert.Equal(t, http.MethodGet, r.Method)
 		jsonReply(t, w, map[string]any{"data": map[string]int64{"quota": 10000, "free": 9000}})
 	default:
 		t.Errorf("unexpected %s %s", r.Method, r.URL)
@@ -498,7 +597,7 @@ func TestUploadVisibility(t *testing.T) {
 	assert.EqualValues(t, 1, obj.Size())
 }
 
-func TestRootLayout(t *testing.T) {
+func TestO2RootLayout(t *testing.T) {
 	fx := newFixture(t)
 	fx.folders = []api.Folder{
 		{ID: "1", Name: "/"},
@@ -543,14 +642,23 @@ func TestRootLayout(t *testing.T) {
 }
 
 func TestPagination(t *testing.T) {
+	for name, mode := range map[string]fixtureMode{"Spec": specMode, "O2": o2Mode} {
+		t.Run(name, func(t *testing.T) { testPagination(t, mode) })
+	}
+}
+
+func testPagination(t *testing.T, mode fixtureMode) {
 	fx := newFixture(t)
+	fx.mode = mode
 	for i := range pageSize + 1 {
 		id := api.ID(strconv.Itoa(i + 1))
 		fx.folders = append(fx.folders, api.Folder{ID: id, Name: fmt.Sprintf("folder%d", i)})
 		fx.media = append(fx.media, api.Media{ID: id, Name: fmt.Sprintf("file%d", i), Type: "file", Status: "U"})
 	}
-	// O2 repeats the root folder at the end of its last page.
-	fx.folders = append(fx.folders, fx.folders[0])
+	if mode == o2Mode {
+		// O2 repeats the root folder at the end of its last page.
+		fx.folders = append(fx.folders, fx.folders[0])
+	}
 	f, err := NewFs(context.Background(), "test", "", fx.config(t))
 	require.NoError(t, err)
 	entries, err := f.List(context.Background(), "")
@@ -558,6 +666,107 @@ func TestPagination(t *testing.T) {
 	assert.Len(t, entries, 2*(pageSize+1))
 	_, err = f.NewObject(context.Background(), fmt.Sprintf("file%d", pageSize))
 	require.NoError(t, err)
+}
+
+func TestO2Filenames(t *testing.T) {
+	fx := newFixture(t)
+	fx.mode = o2Mode
+	ctx := context.Background()
+	f, err := NewFs(ctx, "test", "", fx.config(t))
+	require.NoError(t, err)
+	for _, name := range []string{".hidden", "trailing."} {
+		t.Run(name, func(t *testing.T) {
+			src := object.NewStaticObjectInfo(name, time.Now(), 1, true, nil, f)
+			_, err = f.Put(ctx, strings.NewReader("x"), src)
+			require.NoError(t, err)
+			_, err = f.NewObject(ctx, name)
+			require.NoError(t, err)
+		})
+	}
+}
+
+// SAPI 14.5 §§3.5.25, 3.5.48 and 5.21: literal wire examples, independent of api types.
+func TestSpecListing(t *testing.T) {
+	fx := newFixture(t)
+	var pages atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/sapi/media/folder":
+			jsonReply(t, w, json.RawMessage(`{"data":{"folders":[
+				{"id":2500,"name":"onemediahub","magic":true,"status":"U","date":1231323524524},
+				{"id":"2501","name":"pictures","parentid":2500,"status":"U","date":1231323524524},
+				{"id":2502,"name":"Other","status":"U","date":1231323524524}
+			]}}`))
+		case "/sapi/media":
+			assert.Equal(t, http.MethodPost, r.Method)
+			pages.Add(1)
+			if r.URL.Query().Get("offset") == "" {
+				jsonReply(t, w, json.RawMessage(`{"data":{"media":[
+					{"id":"0","name":"unfiled.txt","mediatype":"file","status":"U","date":1399985134672,"modificationdate":1161931347000,"size":5}
+				]},"more":true}`))
+				return
+			}
+			assert.Equal(t, "1", r.URL.Query().Get("offset"))
+			jsonReply(t, w, json.RawMessage(`{"data":{"media":[
+				{"id":"7","name":"100_1924.jpg","folder":2501,"mediatype":"picture","status":"U","date":1399985134672,"modificationdate":1161931347000,"size":722942}
+			]},"more":false}`))
+		default:
+			fx.serve(t, w, r)
+		}
+	}))
+	defer srv.Close()
+	m := fx.config(t)
+	m["url"] = srv.URL
+	ctx := context.Background()
+	f, err := NewFs(ctx, "test", "", m)
+	require.NoError(t, err)
+	entries, err := f.List(ctx, "")
+	require.NoError(t, err)
+	var names []string
+	for _, entry := range entries {
+		names = append(names, entry.Remote())
+	}
+	assert.ElementsMatch(t, []string{"onemediahub", "Other", "unfiled.txt"}, names)
+	entries, err = f.List(ctx, "onemediahub/pictures")
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "onemediahub/pictures/100_1924.jpg", entries[0].Remote())
+	assert.EqualValues(t, 722942, entries[0].Size())
+	assert.Equal(t, time.UnixMilli(1161931347000), entries[0].ModTime(ctx))
+	assert.EqualValues(t, 4, pages.Load())
+}
+
+// SAPI 14.5 §§3.5.3, 3.5.9, 3.5.14 and 3.5.18 use type-specific numeric ID arrays.
+func TestSpecDelete(t *testing.T) {
+	for _, mediaType := range []string{"picture", "video", "audio", "file"} {
+		t.Run(mediaType, func(t *testing.T) {
+			fx := newFixture(t)
+			var deletes atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Get("action") != "delete" {
+					fx.serve(t, w, r)
+					return
+				}
+				deletes.Add(1)
+				assert.Equal(t, http.MethodPost, r.Method)
+				assert.Equal(t, "/sapi/media/"+mediaType, r.URL.Path)
+				assert.Equal(t, "true", r.URL.Query().Get("softdelete"))
+				b, err := io.ReadAll(r.Body)
+				assert.NoError(t, err)
+				assert.JSONEq(t, `{"data":{"`+mediaType+`s":[23508]}}`, string(b))
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer srv.Close()
+			m := fx.config(t)
+			m["url"] = srv.URL
+			f, err := NewFs(context.Background(), "test", "", m)
+			require.NoError(t, err)
+			obj := &Object{fs: f.(*Fs), info: api.Media{ID: "23508", Type: mediaType}}
+			require.NoError(t, obj.Remove(context.Background()))
+			assert.EqualValues(t, 1, deletes.Load())
+		})
+	}
 }
 
 func TestProtocolIntegration(t *testing.T) {
@@ -571,6 +780,7 @@ func TestProtocolIntegration(t *testing.T) {
 	})
 }
 
+// O2 clients send OAuth credentials on SAPI requests to receive refreshed tokens.
 func TestOAuthRequestHeaders(t *testing.T) {
 	var logins atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -609,6 +819,102 @@ func TestOAuthRequestHeaders(t *testing.T) {
 	_, err = NewFs(context.Background(), "test", "", m)
 	require.NoError(t, err)
 	assert.EqualValues(t, 2, logins.Load())
+}
+
+// SAPI 14.5 §§4.1.3 and 6.3.2: validation keys depend on server configuration.
+func TestSessionWithoutKey(t *testing.T) {
+	var logins atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/sapi/system/information":
+			jsonReply(t, w, json.RawMessage(`{"sapiversion":"14.5"}`))
+		case "/sapi/login":
+			logins.Add(1)
+			jsonReply(t, w, json.RawMessage(`{"data":{"jsessionid":"session","roles":[]}}`))
+		case "/sapi/media":
+			assert.NotContains(t, r.URL.Query(), "validationkey")
+			cookie, err := r.Cookie("JSESSIONID")
+			if assert.NoError(t, err) {
+				assert.Equal(t, "session", cookie.Value)
+			}
+			jsonReply(t, w, json.RawMessage(`{"data":{"quota":1024000,"free":534123}}`))
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+	m := testConfig(t, configmap.Simple{"url": srv.URL, "auth_type": authPassword, "user": "test", "password": obscure.MustObscure("test")})
+	for range 2 {
+		f, err := NewFs(context.Background(), "test", "", m)
+		require.NoError(t, err)
+		_, err = f.(*Fs).About(context.Background())
+		require.NoError(t, err)
+	}
+	assert.EqualValues(t, 1, logins.Load())
+}
+
+// The Zefiro APK uses the native fac- device prefix; fol- logins are rejected.
+func TestPasswordDeviceID(t *testing.T) {
+	fx := newFixture(t)
+	var logins atomic.Int32
+	var expired atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/sapi/login":
+			if !strings.HasPrefix(r.Header.Get("X-deviceid"), "fac-") {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			logins.Add(1)
+		case "/sapi/media/folder":
+			if expired.Swap(false) {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+		}
+		fx.serve(t, w, r)
+	}))
+	defer srv.Close()
+	m := fx.config(t)
+	m["url"] = srv.URL
+	ctx := context.Background()
+	f, err := NewFs(ctx, "test", "", m)
+	require.NoError(t, err)
+	device := m["device_id"]
+	require.NotEmpty(t, device)
+	expired.Store(true)
+	_, err = f.List(ctx, "")
+	require.NoError(t, err)
+	_, err = NewFs(ctx, "test", "", m)
+	require.NoError(t, err)
+	assert.Equal(t, device, m["device_id"])
+	assert.EqualValues(t, 2, logins.Load())
+}
+
+func TestEmptyDownload(t *testing.T) {
+	fx := newFixture(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/empty" {
+			// Zefiro accepts zero-byte uploads but returns 403 from their content URL.
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		fx.serve(t, w, r)
+	}))
+	defer srv.Close()
+	fx.media = []api.Media{{ID: "1", Name: "empty", Size: 0, Type: "file", URL: srv.URL + "/empty"}}
+	ctx := context.Background()
+	f, err := NewFs(ctx, "test", "", fx.config(t))
+	require.NoError(t, err)
+	obj, err := f.NewObject(ctx, "empty")
+	require.NoError(t, err)
+	body, err := obj.Open(ctx)
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, body.Close()) }()
+	content, err := io.ReadAll(body)
+	require.NoError(t, err)
+	assert.Empty(t, content)
 }
 
 func TestUploadDiscovery(t *testing.T) {
@@ -683,6 +989,20 @@ func TestTokenResponse(t *testing.T) {
 	resp := &http.Response{Header: http.Header{"Authorization": {oauthPrefix + base64.StdEncoding.EncodeToString([]byte(`{"data":{"accesstoken":"stale","refreshtoken":"stale"}}`))}}}
 	require.NoError(t, a.saveHeader(resp, "old"))
 	assert.Equal(t, before, m["token"])
+}
+
+// Both O2 APKs preserve tokens when SAPI sends an empty replacement.
+func TestTokenEmptyAccess(t *testing.T) {
+	expiry := time.Now().Add(time.Hour)
+	a := &auth{name: "test", m: configmap.Simple{}, token: &oauth2.Token{AccessToken: "keep", RefreshToken: "old", Expiry: expiry}}
+	header := oauthPrefix + base64.StdEncoding.EncodeToString([]byte(`{"data":{"accesstoken":"","refreshtoken":"rotated","expiresin":"3600"}}`))
+	require.NoError(t, a.saveHeaderLocked(header))
+	assert.Equal(t, "keep", a.token.AccessToken)
+	assert.Equal(t, "rotated", a.token.RefreshToken)
+	assert.Equal(t, expiry, a.token.Expiry)
+
+	a.token = nil
+	require.ErrorContains(t, a.saveHeaderLocked(header), "no access token")
 }
 
 func TestMissingRootFolder(t *testing.T) {
@@ -801,4 +1121,61 @@ func TestDownloadRenewal(t *testing.T) {
 	token, err := oauthutil.GetToken("test", m)
 	require.NoError(t, err)
 	assert.Equal(t, "download-refresh", token.RefreshToken)
+}
+
+// SAPI 14.5 §4.1.1 returns JSON errors with HTTP 200, including on download APIs.
+func TestDownloadJSON(t *testing.T) {
+	const expired = `{"error":{"code":"SEC-1003","message":"Invalid mandatory validation key"}}`
+	for _, tc := range []struct {
+		name        string
+		content     string
+		disposition string
+		err         string
+	}{
+		{name: "Renew", content: `{"value":"file content"}`},
+		{name: "Error", content: `{"error":{"code":"COM-1005","message":"Unsupported operation"}}`, err: "COM-1005"},
+		{name: "Attachment", content: expired, disposition: `attachment; filename="error.json"`},
+		{name: "LargeJSON", content: `{"value":"` + strings.Repeat("x", 128*1024) + `"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newFixture(t)
+			var downloads atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/sapi/download/file" {
+					fx.serve(t, w, r)
+					return
+				}
+				assert.Empty(t, r.Header.Get("Authorization"))
+				w.Header().Set("Content-Type", "application/json")
+				if downloads.Add(1) == 1 {
+					_, err := io.WriteString(w, expired)
+					assert.NoError(t, err)
+					return
+				}
+				w.Header().Set("Content-Disposition", tc.disposition)
+				_, err := io.WriteString(w, tc.content)
+				assert.NoError(t, err)
+			}))
+			defer srv.Close()
+			m := fx.config(t)
+			m["url"] = srv.URL
+			f, err := NewFs(context.Background(), "test", "", m)
+			require.NoError(t, err)
+			u, err := url.Parse(srv.URL + "/sapi/download/file")
+			require.NoError(t, err)
+			body, err := f.(*Fs).open(context.Background(), u, nil)
+			if body != nil {
+				defer func() { assert.NoError(t, body.Close()) }()
+			}
+			if tc.err != "" {
+				require.ErrorContains(t, err, tc.err)
+			} else {
+				require.NoError(t, err)
+				content, err := io.ReadAll(body)
+				require.NoError(t, err)
+				assert.Equal(t, tc.content, string(content))
+			}
+			assert.EqualValues(t, 2, downloads.Load())
+		})
+	}
 }

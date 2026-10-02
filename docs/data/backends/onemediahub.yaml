@@ -3,7 +3,7 @@ name: OneMediaHub
 tier: Tier 4
 maintainers: None
 features_score: 1
-integration_tests: Not run
+integration_tests: Passing
 data_integrity: Modtime
 performance: Medium
 adoption: New

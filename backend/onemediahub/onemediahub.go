@@ -2,13 +2,16 @@
 package onemediahub
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"maps"
+	"mime"
 	"net/http"
 	"net/url"
 	"path"
@@ -33,19 +36,22 @@ import (
 )
 
 const (
-	pageSize         = 100
-	minSleep         = 10 * time.Millisecond
-	maxSleep         = 2 * time.Second
-	decayConstant    = 2
-	dateFormat       = "20060102T150405Z"
-	statusDeleted    = "D"
-	maxAuthAttempts  = 2
-	maxRedirects     = 10
-	deviceHeader     = "X-deviceid"
-	devicePrefix     = "fol-"
-	metadataTimeout  = 30 * time.Second
-	metadataDelay    = 200 * time.Millisecond
-	metadataMaxDelay = 2 * time.Second
+	pageSize             = 100
+	minSleep             = 10 * time.Millisecond
+	maxSleep             = 2 * time.Second
+	decayConstant        = 2
+	dateFormat           = "20060102T150405Z"
+	statusDeleted        = "D"
+	maxAuthAttempts      = 2
+	maxRedirects         = 10
+	deviceHeader         = "X-deviceid"
+	oauthDevicePrefix    = "fol-"
+	passwordDevicePrefix = "fac-"
+	metadataTimeout      = 30 * time.Second
+	metadataDelay        = 200 * time.Millisecond
+	metadataMaxDelay     = 2 * time.Second
+	maxErrorSize         = 64 * 1024
+	sessionCookie        = "JSESSIONID"
 )
 
 func init() {
@@ -94,23 +100,22 @@ func init() {
 			},
 			{
 				Name:     "auth_url",
-				Help:     "OAuth authorization endpoint. Empty uses the O2 default only for the O2 server.",
+				Help:     "OAuth authorization endpoint. Empty uses defaults for O2 Spain or Germany.",
 				Advanced: true,
 			},
 			{
 				Name:     "token_url",
-				Help:     "OAuth token endpoint. Empty uses the O2 default only for the O2 server.",
+				Help:     "OAuth token endpoint. Empty uses defaults for O2 Spain or Germany.",
 				Advanced: true,
 			},
 			{
 				Name:     "redirect_url",
-				Help:     "Registered OAuth callback URL. Empty uses the O2 default only for the O2 server.",
+				Help:     "Registered OAuth callback URL. Empty uses defaults for O2 Spain or Germany.",
 				Advanced: true,
 			},
 			{
 				Name:     "scope",
-				Help:     "Space-separated OAuth scopes; offline access must yield a refresh token.",
-				Default:  "openid",
+				Help:     "Space-separated OAuth scopes. Empty uses openid for O2 Spain and no scopes elsewhere.",
 				Advanced: true,
 			},
 			{
@@ -189,7 +194,7 @@ func init() {
 			{
 				Name:     config.ConfigEncoding,
 				Help:     config.ConfigEncodingHelp,
-				Default:  encoder.Display | encoder.EncodeBackSlash | encoder.EncodeLeftPeriod | encoder.EncodeInvalidUtf8,
+				Default:  encoder.Display | encoder.EncodeBackSlash | encoder.EncodeLeftPeriod | encoder.EncodeRightPeriod | encoder.EncodeInvalidUtf8,
 				Advanced: true,
 			},
 		},
@@ -293,7 +298,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// Some providers require a stable client identity during login.
 	if opt.DeviceID == "" {
 		id := uuid.New()
-		opt.DeviceID = devicePrefix + base64.StdEncoding.EncodeToString(id[:])
+		if opt.AuthType == authPassword {
+			opt.DeviceID = passwordDevicePrefix + hex.EncodeToString(id[:])
+		} else {
+			opt.DeviceID = oauthDevicePrefix + base64.StdEncoding.EncodeToString(id[:])
+		}
 		m.Set("device_id", opt.DeviceID)
 	}
 	base := strings.TrimRight(opt.URL, "/") + "/" + strings.Trim(opt.APIPath, "/")
@@ -437,12 +446,14 @@ func (f *Fs) send(ctx context.Context, opts rest.Opts, request any, state authSt
 	if attemptOpts.Parameters == nil {
 		attemptOpts.Parameters = url.Values{}
 	}
-	attemptOpts.Parameters.Set("validationkey", session.Key)
+	if session.Key != "" {
+		attemptOpts.Parameters.Set("validationkey", session.Key)
+	}
 	attemptOpts.ExtraHeaders = map[string]string{}
 	for key, value := range opts.ExtraHeaders {
 		attemptOpts.ExtraHeaders[key] = value
 	}
-	cookie := &http.Cookie{Name: "JSESSIONID", Value: session.ID}
+	cookie := &http.Cookie{Name: sessionCookie, Value: session.ID}
 	attemptOpts.ExtraHeaders["Cookie"] = cookie.String()
 	if state.header != "" {
 		attemptOpts.ExtraHeaders["Authorization"] = state.header
@@ -814,6 +825,11 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	if err := o.refresh(ctx); err != nil {
 		return nil, err
 	}
+
+	// Some providers have no downloadable blob for a stored empty file.
+	if o.Size() == 0 {
+		return io.NopCloser(strings.NewReader("")), nil
+	}
 	u, err := url.Parse(o.info.URL)
 	if err != nil || o.info.URL == "" {
 		return nil, errors.New("invalid media download URL")
@@ -825,6 +841,30 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	}
 	fs.FixRangeOption(options, o.Size())
 	return o.fs.open(ctx, u, options)
+}
+
+func downloadError(resp *http.Response) error {
+	contentType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if (contentType != "application/json" && contentType != "text/javascript") || resp.Header.Get("Content-Disposition") != "" {
+		return nil
+	}
+
+	// SAPI errors use HTTP 200. Preserve JSON file contents and bound buffering.
+	b, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorSize+1))
+	var reply api.Response
+	if err == nil && len(b) <= maxErrorSize && json.Unmarshal(b, &reply) == nil && reply.Error != nil && reply.Error.Code != "" {
+		err = reply.Error
+	}
+
+	if err != nil {
+		_ = resp.Body.Close()
+		return err
+	}
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(bytes.NewReader(b), resp.Body), resp.Body}
+	return nil
 }
 
 func (f *Fs) open(ctx context.Context, u *url.URL, options []fs.OpenOption) (io.ReadCloser, error) {
@@ -844,7 +884,7 @@ func (f *Fs) open(ctx context.Context, u *url.URL, options []fs.OpenOption) (io.
 					return false, err
 				}
 				opts.ExtraHeaders = map[string]string{
-					"Cookie":     (&http.Cookie{Name: "JSESSIONID", Value: state.session.ID}).String(),
+					"Cookie":     (&http.Cookie{Name: sessionCookie, Value: state.session.ID}).String(),
 					deviceHeader: f.opt.DeviceID,
 				}
 				if state.header != "" {
@@ -852,7 +892,9 @@ func (f *Fs) open(ctx context.Context, u *url.URL, options []fs.OpenOption) (io.
 				}
 				target := *u
 				q := target.Query()
-				q.Set("validationkey", state.session.Key)
+				if state.session.Key != "" {
+					q.Set("validationkey", state.session.Key)
+				}
 				target.RawQuery = q.Encode()
 				opts.RootURL = target.String()
 			}
@@ -883,7 +925,11 @@ func (f *Fs) open(ctx context.Context, u *url.URL, options []fs.OpenOption) (io.
 					}
 					return false, saveErr
 				}
-				if resp.StatusCode == http.StatusUnauthorized {
+				if err == nil {
+					err = downloadError(resp)
+				}
+				var apiErr *api.Error
+				if resp.StatusCode == http.StatusUnauthorized || (errors.As(err, &apiErr) && apiErr.Code == invalidKeyCode) {
 					f.auth.invalidate(state.session)
 					if attempt == 0 {
 						continue
