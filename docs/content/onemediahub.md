@@ -29,6 +29,9 @@ browser login while the provider accepts the saved refresh token. Revoked or
 expired refresh tokens require `rclone config reconnect remote:`.
 Use a writable configuration file to retain refreshed credentials across runs.
 Rclone also saves a stable `device_id` for the server's client identification.
+Like the Windows client, it saves the SAPI session and validation key for reuse
+across commands. Cached sessions are bound to the server, client and credentials;
+expired sessions are renewed automatically.
 
 ## Other OneMediaHub servers
 
@@ -70,14 +73,31 @@ rclone copy remote:photos ./download
 rclone about remote:
 ```
 
-By default, the root contains top-level folders and unfiled media. Set
-`root_folder_id` to limit the remote to an existing folder.
+By default, the root contains top-level folders and unfiled media. The server's
+`parentid` relationships determine the hierarchy; watch folders (`magic`)
+are ordinary directories. Set `root_folder_id` to use a specific folder.
+
+O2 may place its folders inside a directory named `/`. Rclone represents a
+slash inside a name as `／` (U+FF0F), so list its children with:
+
+```console
+rclone lsd 'remote:／'
+```
+
+`lsd` lists directories at one level. Use `lsd -R` for all directories or
+`ls` for files.
+
+The O2 Windows client selects the `magic` folder returned by
+`/media/folder/root?action=get`, an endpoint absent from the 14.5 guide.
+Set `root_folder_id` to that folder's ID to match its view. Rclone's default
+view preserves other top-level folders and unfiled media.
 
 ## Limitations
 
 - Uploads require a known size. Timestamps are preserved to the nearest second
   when uploading; changing timestamps without uploading is unsupported.
 - File deletion moves items to the server's trash. Empty folders are deleted.
+- Leading periods are encoded because some upload servers reject dotfiles.
 - The API does not specify a content-checksum contract for ETags, so this
   backend does not report hashes.
 - Listing uses the paginated folder and generic-media APIs and filters by

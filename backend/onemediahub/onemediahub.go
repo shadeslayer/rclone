@@ -3,6 +3,7 @@ package onemediahub
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,15 +33,19 @@ import (
 )
 
 const (
-	pageSize        = 100
-	minSleep        = 10 * time.Millisecond
-	maxSleep        = 2 * time.Second
-	decayConstant   = 2
-	dateFormat      = "20060102T150405Z"
-	statusDeleted   = "D"
-	maxAuthAttempts = 2
-	maxRedirects    = 10
-	deviceHeader    = "X-deviceid"
+	pageSize         = 100
+	minSleep         = 10 * time.Millisecond
+	maxSleep         = 2 * time.Second
+	decayConstant    = 2
+	dateFormat       = "20060102T150405Z"
+	statusDeleted    = "D"
+	maxAuthAttempts  = 2
+	maxRedirects     = 10
+	deviceHeader     = "X-deviceid"
+	devicePrefix     = "fol-"
+	metadataTimeout  = 30 * time.Second
+	metadataDelay    = 200 * time.Millisecond
+	metadataMaxDelay = 2 * time.Second
 )
 
 func init() {
@@ -163,6 +168,13 @@ func init() {
 				Hide:      fs.OptionHideConfigurator,
 			},
 			{
+				Name:      sessionKey,
+				Help:      "Saved server session, renewed automatically.",
+				Sensitive: true,
+				Advanced:  true,
+				Hide:      fs.OptionHideConfigurator,
+			},
+			{
 				Name:      authStateKey,
 				Help:      "Temporary OAuth state.",
 				Sensitive: true,
@@ -177,7 +189,7 @@ func init() {
 			{
 				Name:     config.ConfigEncoding,
 				Help:     config.ConfigEncodingHelp,
-				Default:  encoder.Display | encoder.EncodeBackSlash | encoder.EncodeInvalidUtf8,
+				Default:  encoder.Display | encoder.EncodeBackSlash | encoder.EncodeLeftPeriod | encoder.EncodeInvalidUtf8,
 				Advanced: true,
 			},
 		},
@@ -280,7 +292,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	// Some providers require a stable client identity during login.
 	if opt.DeviceID == "" {
-		opt.DeviceID = "rclone-" + uuid.NewString()
+		id := uuid.New()
+		opt.DeviceID = devicePrefix + base64.StdEncoding.EncodeToString(id[:])
 		m.Set("device_id", opt.DeviceID)
 	}
 	base := strings.TrimRight(opt.URL, "/") + "/" + strings.Trim(opt.APIPath, "/")
@@ -475,10 +488,20 @@ func (f *Fs) request(ctx context.Context, method, endpoint, action string, param
 	return f.call(ctx, rest.Opts{Method: method, Path: endpoint, Parameters: params}, request)
 }
 
+func pageParams(offset int) url.Values {
+	params := url.Values{"limit": {strconv.Itoa(pageSize)}}
+	// Some servers reject an explicit zero offset.
+	if offset > 0 {
+		params.Set("offset", strconv.Itoa(offset))
+	}
+	return params
+}
+
 func (f *Fs) folders(ctx context.Context) ([]api.Folder, error) {
 	var folders []api.Folder
+	seen := map[api.ID]struct{}{}
 	for offset := 0; ; {
-		reply, err := f.request(ctx, http.MethodGet, "/media/folder", "get", url.Values{"limit": {strconv.Itoa(pageSize)}, "offset": {strconv.Itoa(offset)}}, nil)
+		reply, err := f.request(ctx, http.MethodGet, "/media/folder", "get", pageParams(offset), nil)
 		if err != nil {
 			return nil, err
 		}
@@ -489,7 +512,14 @@ func (f *Fs) folders(ctx context.Context) ([]api.Folder, error) {
 		if err := json.Unmarshal(reply.Data, &data); err != nil {
 			return nil, err
 		}
-		folders = append(folders, data.Folders...)
+		// Some servers repeat the root folder on the last page.
+		for _, folder := range data.Folders {
+			if _, ok := seen[folder.ID]; ok {
+				continue
+			}
+			seen[folder.ID] = struct{}{}
+			folders = append(folders, folder)
+		}
 		if len(data.Folders) < pageSize {
 			return folders, nil
 		}
@@ -507,9 +537,9 @@ func (f *Fs) FindLeaf(ctx context.Context, parent, leaf string) (string, bool, e
 	if err != nil {
 		return "", false, err
 	}
-	leaf = f.opt.Enc.FromStandardName(leaf)
+	// Compare displayed names to resolve server-created names such as "/".
 	for _, folder := range folders {
-		if sameParent(folder.ParentID, parent) && folder.Name == leaf && folder.Status != statusDeleted && !folder.SoftDeleted {
+		if sameParent(folder.ParentID, parent) && f.opt.Enc.ToStandardName(folder.Name) == leaf && folder.Status != statusDeleted && !folder.SoftDeleted {
 			return string(folder.ID), true, nil
 		}
 	}
@@ -537,8 +567,7 @@ func (f *Fs) media(ctx context.Context, ids []api.ID, visit func(api.Media) erro
 		if ids != nil {
 			data["ids"] = ids
 		} else {
-			params.Set("limit", strconv.Itoa(pageSize))
-			params.Set("offset", strconv.Itoa(offset))
+			params = pageParams(offset)
 		}
 		reply, err := f.request(ctx, http.MethodPost, "/media", "get", params, data)
 		if err != nil {
@@ -546,6 +575,7 @@ func (f *Fs) media(ctx context.Context, ids []api.ID, visit func(api.Media) erro
 		}
 		var result struct {
 			Media []api.Media `json:"media"`
+			More  bool        `json:"more"`
 		}
 
 		if err := json.Unmarshal(reply.Data, &result); err != nil {
@@ -565,7 +595,7 @@ func (f *Fs) media(ctx context.Context, ids []api.ID, visit func(api.Media) erro
 			}
 		}
 
-		if ids != nil || !reply.More {
+		if ids != nil || !(reply.More || result.More) {
 			return nil
 		}
 
@@ -756,6 +786,26 @@ func (o *Object) refresh(ctx context.Context) error {
 	return nil
 }
 
+func (o *Object) waitMetadata(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, metadataTimeout)
+	defer cancel()
+	delay := metadataDelay
+	for {
+		err := o.refresh(ctx)
+		if !errors.Is(err, fs.ErrorObjectNotFound) {
+			return err
+		}
+
+		// The upload server may finish before SAPI can see the new media.
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for uploaded media: %w", ctx.Err())
+		case <-time.After(delay):
+		}
+		delay = min(2*delay, metadataMaxDelay)
+	}
+}
+
 // Open downloads original content and supports range requests.
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	// Range downloads may open the same object concurrently.
@@ -876,7 +926,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return errors.New("upload returned no media ID")
 	}
 	o.info.ID = reply.ID
-	return o.refresh(ctx)
+	return o.waitMetadata(ctx)
 }
 
 // Remove moves the media item to the trash.

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -92,8 +93,11 @@ func TestSessionRenewal(t *testing.T) {
 	defer srv.Close()
 	m := testConfig(t, configmap.Simple{"url": srv.URL + "/tenant", "api_path": "/api", "auth_type": authPassword, "user": "alice", "password": obscure.MustObscure("password&=")})
 	ctx := context.Background()
+	_, err := NewFs(ctx, "test", "", m)
+	require.NoError(t, err)
 	remote, err := NewFs(ctx, "test", "", m)
 	require.NoError(t, err)
+	require.EqualValues(t, 1, logins.Load())
 	expire.Store(true)
 	entries, err := remote.List(ctx, "")
 	require.NoError(t, err)
@@ -126,7 +130,9 @@ func TestOAuthRefreshAndRestart(t *testing.T) {
 			exchanges.Add(1)
 			jsonReply(t, w, map[string]any{"access_token": "access-new", "refresh_token": "refresh-new", "expires_in": 3600, "token_type": "Bearer"})
 		case "/sapi/login/oauth":
+			assert.Equal(t, "true", r.URL.Query().Get("responsetime"))
 			assert.NotEmpty(t, r.Header.Get("X-deviceid"))
+			assert.True(t, strings.HasPrefix(r.Header.Get("X-deviceid"), "fol-"))
 			if deviceID == "" {
 				deviceID = r.Header.Get("X-deviceid")
 			}
@@ -164,6 +170,10 @@ func TestOAuthRefreshAndRestart(t *testing.T) {
 		require.NoError(t, err)
 	}
 	assert.EqualValues(t, 1, exchanges.Load())
+	assert.EqualValues(t, 1, logins.Load())
+	m[sessionKey] = ""
+	_, err := NewFs(context.Background(), "test", "", m)
+	require.NoError(t, err)
 	assert.EqualValues(t, 2, logins.Load())
 	assert.NotEmpty(t, m["device_id"])
 	assert.Equal(t, deviceID, m["device_id"])
@@ -171,6 +181,44 @@ func TestOAuthRefreshAndRestart(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "refresh-rotated", token.RefreshToken)
 	assert.True(t, token.Valid())
+}
+
+func TestSessionScope(t *testing.T) {
+	var logins atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/system/information"):
+			jsonReply(t, w, map[string]string{"sapiversion": "14.5"})
+		case strings.HasSuffix(r.URL.Path, "/login"):
+			logins.Add(1)
+			assert.Empty(t, r.Header.Get("Cookie"))
+			jsonReply(t, w, map[string]any{"data": map[string]string{"jsessionid": "session", "validationkey": "key"}})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+	m := testConfig(t, configmap.Simple{"url": srv.URL, "auth_type": authPassword, "user": "test", "password": obscure.MustObscure("test")})
+	for range 2 {
+		_, err := NewFs(context.Background(), "test", "", m)
+		require.NoError(t, err)
+	}
+	require.EqualValues(t, 1, logins.Load())
+	require.NotEmpty(t, m[sessionKey])
+	for key, value := range map[string]string{
+		"url": srv.URL + "/tenant", "api_path": "/other", "user": "other",
+		"password": obscure.MustObscure("other"), "device_id": "other",
+		sessionKey: "invalid JSON",
+	} {
+		t.Run(key, func(t *testing.T) {
+			changed := maps.Clone(m)
+			changed[key] = value
+			before := logins.Load()
+			_, err := NewFs(context.Background(), "test", "", changed)
+			require.NoError(t, err)
+			assert.Equal(t, before+1, logins.Load())
+		})
+	}
 }
 
 func TestConfigOAuth(t *testing.T) {
@@ -211,12 +259,13 @@ func TestIntegration(t *testing.T) {
 
 // fixture implements the documented wire protocol and keeps binary data separately.
 type fixture struct {
-	mu      sync.Mutex
-	folders []api.Folder
-	media   []api.Media
-	content map[api.ID]string
-	nextID  int
-	server  *httptest.Server
+	mu           sync.Mutex
+	pendingReads int
+	folders      []api.Folder
+	media        []api.Media
+	content      map[api.ID]string
+	nextID       int
+	server       *httptest.Server
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -230,6 +279,11 @@ func newFixture(t *testing.T) *fixture {
 func (fx *fixture) serve(t *testing.T, w http.ResponseWriter, r *http.Request) {
 	fx.mu.Lock()
 	defer fx.mu.Unlock()
+	if r.URL.Query().Get("offset") == "0" {
+		jsonReply(t, w, map[string]any{"error": map[string]string{"code": "COM-1021", "message": "Invalid offset"}})
+		return
+	}
+
 	if r.URL.Path == "/sapi/system/information" {
 		jsonReply(t, w, map[string]string{"sapiversion": "14.5"})
 		return
@@ -291,6 +345,11 @@ func (fx *fixture) serve(t *testing.T, w http.ResponseWriter, r *http.Request) {
 		more := false
 		if data.IDs != nil {
 			items = nil
+			if fx.pendingReads > 0 {
+				fx.pendingReads--
+				jsonReply(t, w, map[string]any{"data": map[string]any{"media": []api.Media{}}})
+				return
+			}
 			for _, item := range fx.media {
 				for _, id := range data.IDs {
 					if id == item.ID {
@@ -305,7 +364,7 @@ func (fx *fixture) serve(t *testing.T, w http.ResponseWriter, r *http.Request) {
 			more = end < len(items)
 			items = items[min(offset, end):end]
 		}
-		jsonReply(t, w, map[string]any{"data": map[string]any{"media": items}, "more": more})
+		jsonReply(t, w, map[string]any{"data": map[string]any{"media": items, "more": more}})
 	case (r.URL.Path == "/sapi/upload" || r.URL.Path == "/sapi/upload/file") && action == "save":
 		if err := r.ParseMultipartForm(1 << 20); err != nil {
 			http.Error(w, "invalid upload", http.StatusBadRequest)
@@ -315,6 +374,10 @@ func (fx *fixture) serve(t *testing.T, w http.ResponseWriter, r *http.Request) {
 		require.NoError(t, json.Unmarshal([]byte(r.FormValue("data")), &envelope))
 		var data api.Upload
 		require.NoError(t, json.Unmarshal(envelope.Data, &data))
+		if strings.HasPrefix(data.Name, ".") {
+			jsonReply(t, w, map[string]any{"error": map[string]string{"code": "COM-1011", "message": "Missing name"}})
+			return
+		}
 		file, header, err := r.FormFile("file")
 		require.NoError(t, err)
 		content, err := io.ReadAll(file)
@@ -423,6 +486,62 @@ func TestFileOperations(t *testing.T) {
 	require.NoError(t, f.Rmdir(ctx, "parent"))
 }
 
+func TestUploadVisibility(t *testing.T) {
+	fx := newFixture(t)
+	fx.pendingReads = 1
+	ctx := context.Background()
+	f, err := NewFs(ctx, "test", "", fx.config(t))
+	require.NoError(t, err)
+	src := object.NewStaticObjectInfo("file", time.Now(), 1, true, nil, f)
+	obj, err := f.Put(ctx, strings.NewReader("x"), src)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, obj.Size())
+}
+
+func TestRootLayout(t *testing.T) {
+	fx := newFixture(t)
+	fx.folders = []api.Folder{
+		{ID: "1", Name: "/"},
+		{ID: "2", ParentID: "1", Name: "Backups"},
+		{ID: "4", Name: "Other"},
+	}
+	fx.media = []api.Media{{ID: "3", FolderID: "1", Name: "root.txt"}}
+	ctx := context.Background()
+	m := fx.config(t)
+	nested, err := NewFs(ctx, "test", "／", m)
+	require.NoError(t, err)
+	entries, err := nested.List(ctx, "")
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+	f, err := NewFs(ctx, "test", "", m)
+	require.NoError(t, err)
+	entries, err = f.List(ctx, "")
+	require.NoError(t, err)
+	var names []string
+	for _, entry := range entries {
+		names = append(names, entry.Remote())
+	}
+	assert.ElementsMatch(t, []string{"／", "Other"}, names)
+	entries, err = f.List(ctx, "／")
+	require.NoError(t, err)
+	names = nil
+	for _, entry := range entries {
+		names = append(names, entry.Remote())
+	}
+	assert.ElementsMatch(t, []string{"／/Backups", "／/root.txt"}, names)
+	_, err = f.NewObject(ctx, "／/root.txt")
+	require.NoError(t, err)
+	require.NoError(t, f.Mkdir(ctx, "／/new"))
+	assert.Equal(t, api.ID("1"), fx.folders[len(fx.folders)-1].ParentID)
+
+	m["root_folder_id"] = "2"
+	f, err = NewFs(ctx, "test", "", m)
+	require.NoError(t, err)
+	entries, err = f.List(ctx, "")
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+}
+
 func TestPagination(t *testing.T) {
 	fx := newFixture(t)
 	for i := range pageSize + 1 {
@@ -430,6 +549,8 @@ func TestPagination(t *testing.T) {
 		fx.folders = append(fx.folders, api.Folder{ID: id, Name: fmt.Sprintf("folder%d", i)})
 		fx.media = append(fx.media, api.Media{ID: id, Name: fmt.Sprintf("file%d", i), Type: "file", Status: "U"})
 	}
+	// O2 repeats the root folder at the end of its last page.
+	fx.folders = append(fx.folders, fx.folders[0])
 	f, err := NewFs(context.Background(), "test", "", fx.config(t))
 	require.NoError(t, err)
 	entries, err := f.List(context.Background(), "")
@@ -451,6 +572,7 @@ func TestProtocolIntegration(t *testing.T) {
 }
 
 func TestOAuthRequestHeaders(t *testing.T) {
+	var logins atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/sapi/system/information" {
 			jsonReply(t, w, map[string]string{"sapiversion": "31.0"})
@@ -461,6 +583,7 @@ func TestOAuthRequestHeaders(t *testing.T) {
 		assert.True(t, strings.HasPrefix(header, oauthPrefix), "desktop OAuth is required on each SAPI request")
 		switch r.URL.Path {
 		case "/sapi/login/oauth":
+			logins.Add(1)
 			jsonReply(t, w, map[string]any{"data": map[string]string{"jsessionid": "session", "validationkey": "key"}})
 		case "/sapi/media/folder":
 			w.Header().Set("Authorization", oauthPrefix+base64.StdEncoding.EncodeToString([]byte(`{"data":{"accesstoken":"rotated","refreshtoken":"rotated-refresh","expiresin":3600}}`)))
@@ -479,6 +602,13 @@ func TestOAuthRequestHeaders(t *testing.T) {
 	token, err := oauthutil.GetToken("test", m)
 	require.NoError(t, err)
 	assert.Equal(t, "rotated-refresh", token.RefreshToken)
+	_, err = NewFs(context.Background(), "test", "", m)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, logins.Load())
+	require.NoError(t, oauthutil.PutToken("test", m, &oauth2.Token{AccessToken: "other", RefreshToken: "other-refresh"}, false))
+	_, err = NewFs(context.Background(), "test", "", m)
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, logins.Load())
 }
 
 func TestUploadDiscovery(t *testing.T) {

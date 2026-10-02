@@ -2,6 +2,7 @@ package onemediahub
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -32,6 +33,7 @@ const (
 	authStateKey    = "config_auth_state"
 	authVerifierKey = "config_auth_verifier"
 	credentialsKey  = "oauth_credentials"
+	sessionKey      = "session"
 	oauthPrefix     = "oauth "
 	invalidKeyCode  = "SEC-1003"
 )
@@ -159,6 +161,7 @@ func configure(ctx context.Context, name string, m configmap.Mapper, in fs.Confi
 		m.Set(authStateKey, "")
 		m.Set(authVerifierKey, "")
 		m.Set(credentialsKey, "")
+		m.Set(sessionKey, "")
 		return nil, nil
 	default:
 		return nil, fmt.Errorf("unknown configuration state %q", in.State)
@@ -175,6 +178,46 @@ type auth struct {
 	httpClient *http.Client
 	session    api.Session
 	token      *oauth2.Token
+}
+
+type storedSession struct {
+	api.Session
+	Scope string `json:"scope"` // Scope binds the session to its server and credentials.
+}
+
+func (a *auth) scope() string {
+	// Session reuse requires the same server, client and credentials.
+	values := []string{a.opt.URL, a.opt.APIPath, a.opt.AuthType, a.opt.User, a.opt.Password,
+		a.opt.ClientID, a.opt.ClientSecret, a.opt.AuthURL, a.opt.TokenURL,
+		a.opt.Platform, a.opt.MSISDN, a.opt.DeviceID, a.opt.UserAgent}
+	if a.token != nil {
+		values = append(values, a.token.AccessToken, a.token.RefreshToken)
+	}
+	b, _ := json.Marshal(values)
+	return fmt.Sprintf("%x", sha256.Sum256(b))
+}
+
+func (a *auth) restoreSession() {
+	raw, _ := a.m.Get(sessionKey)
+	var saved storedSession
+	if json.Unmarshal([]byte(raw), &saved) == nil && saved.Scope == a.scope() && saved.ID != "" && saved.Key != "" {
+		a.session = saved.Session
+	}
+}
+
+func (a *auth) saveSession() error {
+	if a.session.ID == "" {
+		return nil
+	}
+	b, err := json.Marshal(storedSession{Session: a.session, Scope: a.scope()})
+	if err != nil {
+		return err
+	}
+
+	if saved, _ := a.m.Get(sessionKey); saved != string(b) {
+		a.m.Set(sessionKey, string(b))
+	}
+	return nil
 }
 
 func (a *auth) saveHeader(resp *http.Response, usedToken string) error {
@@ -255,7 +298,7 @@ func (a *auth) saveHeaderLocked(header string) error {
 	}
 	a.token = token
 	a.m.Set(credentialsKey, string(b))
-	return nil
+	return a.saveSession()
 }
 
 func (a *auth) header() (string, error) {
@@ -330,6 +373,10 @@ func (a *auth) prepare(ctx context.Context) (authState, error) {
 		}
 	}
 	if a.session.ID == "" {
+		a.restoreSession()
+	}
+
+	if a.session.ID == "" {
 		if err := a.login(ctx); err != nil {
 			return authState{}, err
 		}
@@ -348,7 +395,7 @@ func (a *auth) prepare(ctx context.Context) (authState, error) {
 
 // login requires mu. Sessions are recreated without prompting the user.
 func (a *auth) login(ctx context.Context) error {
-	opts := rest.Opts{Method: http.MethodPost, Path: "/login", Parameters: url.Values{"action": {"login"}}, ContentType: "application/x-www-form-urlencoded; charset=UTF-8", NoRedirect: true}
+	opts := rest.Opts{Method: http.MethodPost, Path: "/login", Parameters: url.Values{"action": {"login"}, "responsetime": {"true"}}, ContentType: "application/x-www-form-urlencoded; charset=UTF-8", NoRedirect: true}
 	switch a.opt.AuthType {
 	case authPassword:
 		password, err := obscure.Reveal(a.opt.Password)
@@ -387,7 +434,7 @@ func (a *auth) login(ctx context.Context) error {
 		return errors.New("login response has no session or validation key")
 	}
 	a.session = session
-	return nil
+	return a.saveSession()
 }
 
 func (a *auth) invalidate(session api.Session) {
@@ -395,5 +442,6 @@ func (a *auth) invalidate(session api.Session) {
 	defer a.mu.Unlock()
 	if a.session == session {
 		a.session = api.Session{}
+		a.m.Set(sessionKey, "")
 	}
 }
