@@ -348,14 +348,13 @@ func (a *auth) prepare(ctx context.Context) (authState, error) {
 
 // login requires mu. Sessions are recreated without prompting the user.
 func (a *auth) login(ctx context.Context) error {
-	opts := rest.Opts{Method: http.MethodPost, Path: "/login", Parameters: url.Values{"action": {"login"}}, NoRedirect: true}
+	opts := rest.Opts{Method: http.MethodPost, Path: "/login", Parameters: url.Values{"action": {"login"}}, ContentType: "application/x-www-form-urlencoded; charset=UTF-8", NoRedirect: true}
 	switch a.opt.AuthType {
 	case authPassword:
 		password, err := obscure.Reveal(a.opt.Password)
 		if err != nil {
 			return fmt.Errorf("invalid password: %w", err)
 		}
-		opts.ContentType = "application/x-www-form-urlencoded"
 		opts.Body = strings.NewReader(url.Values{"login": {a.opt.User}, "password": {password}}.Encode())
 	case authOAuth:
 		header, err := a.header()

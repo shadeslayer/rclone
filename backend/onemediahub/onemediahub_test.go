@@ -109,11 +109,13 @@ func TestSessionRenewal(t *testing.T) {
 
 func TestOAuthRefreshAndRestart(t *testing.T) {
 	var exchanges, logins atomic.Int32
+	var deviceID string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/sapi/system/information":
 			jsonReply(t, w, map[string]string{"sapiversion": "31.0"})
 		case "/token":
+			assert.Empty(t, r.Header.Get("X-deviceid"), "storage identity must not reach the OAuth provider")
 			require.NoError(t, r.ParseForm())
 			assert.Equal(t, "refresh_token", r.PostForm.Get("grant_type"))
 			assert.Equal(t, "refresh-old", r.PostForm.Get("refresh_token"))
@@ -124,6 +126,12 @@ func TestOAuthRefreshAndRestart(t *testing.T) {
 			exchanges.Add(1)
 			jsonReply(t, w, map[string]any{"access_token": "access-new", "refresh_token": "refresh-new", "expires_in": 3600, "token_type": "Bearer"})
 		case "/sapi/login/oauth":
+			assert.NotEmpty(t, r.Header.Get("X-deviceid"))
+			if deviceID == "" {
+				deviceID = r.Header.Get("X-deviceid")
+			}
+			assert.Equal(t, deviceID, r.Header.Get("X-deviceid"))
+			assert.Equal(t, "application/x-www-form-urlencoded; charset=UTF-8", r.Header.Get("Content-Type"))
 			require.True(t, strings.HasPrefix(r.Header.Get("Authorization"), oauthPrefix))
 			b, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(r.Header.Get("Authorization"), oauthPrefix))
 			require.NoError(t, err)
@@ -157,6 +165,8 @@ func TestOAuthRefreshAndRestart(t *testing.T) {
 	}
 	assert.EqualValues(t, 1, exchanges.Load())
 	assert.EqualValues(t, 2, logins.Load())
+	assert.NotEmpty(t, m["device_id"])
+	assert.Equal(t, deviceID, m["device_id"])
 	token, err := oauthutil.GetToken("test", m)
 	require.NoError(t, err)
 	assert.Equal(t, "refresh-rotated", token.RefreshToken)
@@ -447,6 +457,7 @@ func TestOAuthRequestHeaders(t *testing.T) {
 			return
 		}
 		header := r.Header.Get("Authorization")
+		assert.Equal(t, "configured-device", r.Header.Get("X-deviceid"))
 		assert.True(t, strings.HasPrefix(header, oauthPrefix), "desktop OAuth is required on each SAPI request")
 		switch r.URL.Path {
 		case "/sapi/login/oauth":
@@ -459,7 +470,7 @@ func TestOAuthRequestHeaders(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
-	m := testConfig(t, configmap.Simple{"url": srv.URL})
+	m := testConfig(t, configmap.Simple{"url": srv.URL, "device_id": "configured-device"})
 	require.NoError(t, oauthutil.PutToken("test", m, &oauth2.Token{AccessToken: "access", RefreshToken: "refresh"}, false))
 	f, err := NewFs(context.Background(), "test", "", m)
 	require.NoError(t, err)
@@ -557,6 +568,7 @@ func TestMissingRootFolder(t *testing.T) {
 func TestDownloadRedirect(t *testing.T) {
 	fx := newFixture(t)
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Empty(t, r.Header.Get("X-deviceid"))
 		assert.Empty(t, r.Header.Get("Cookie"), "download redirects must not forward the SAPI session")
 		assert.Empty(t, r.Header.Get("Referer"), "download redirects must not expose the validation key")
 		assert.Empty(t, r.Header.Get("Authorization"))

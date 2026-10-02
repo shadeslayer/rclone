@@ -28,6 +28,7 @@ credentials returned by OneMediaHub. Subsequent commands do not require a
 browser login while the provider accepts the saved refresh token. Revoked or
 expired refresh tokens require `rclone config reconnect remote:`.
 Use a writable configuration file to retain refreshed credentials across runs.
+Rclone also saves a stable `device_id` for the server's client identification.
 
 ## Other OneMediaHub servers
 

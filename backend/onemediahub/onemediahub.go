@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rclone/rclone/backend/onemediahub/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
@@ -39,6 +40,7 @@ const (
 	statusDeleted   = "D"
 	maxAuthAttempts = 2
 	maxRedirects    = 10
+	deviceHeader    = "X-deviceid"
 )
 
 func init() {
@@ -119,6 +121,12 @@ func init() {
 				Advanced:  true,
 			},
 			{
+				Name:      "device_id",
+				Help:      "Persistent client device ID. Empty generates and saves one automatically.",
+				Sensitive: true,
+				Advanced:  true,
+			},
+			{
 				Name:     "user_agent",
 				Help:     "HTTP User-Agent accepted by the provider.",
 				Default:  "OneMediaHub",
@@ -189,6 +197,7 @@ type options struct {
 	Scope        string               `config:"scope"`
 	Platform     string               `config:"platform"`
 	MSISDN       string               `config:"msisdn"`
+	DeviceID     string               `config:"device_id"`
 	UserAgent    string               `config:"user_agent"`
 	UploadURL    string               `config:"upload_url"`
 	APIPath      string               `config:"api_path"`
@@ -268,9 +277,15 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if opt.AuthType == authPassword && (opt.User == "" || opt.Password == "") {
 		return nil, errors.New("password authentication requires user and password")
 	}
+
+	// Some providers require a stable client identity during login.
+	if opt.DeviceID == "" {
+		opt.DeviceID = "rclone-" + uuid.NewString()
+		m.Set("device_id", opt.DeviceID)
+	}
 	base := strings.TrimRight(opt.URL, "/") + "/" + strings.Trim(opt.APIPath, "/")
 	client := newClient(ctx, opt)
-	srv := rest.NewClient(client).SetRoot(base).SetErrorHandler(errorHandler)
+	srv := rest.NewClient(client).SetRoot(base).SetHeader(deviceHeader, opt.DeviceID).SetErrorHandler(errorHandler)
 	f := &Fs{name: name, root: strings.Trim(root, "/"), opt: opt, srv: srv, download: rest.NewClient(client),
 		pacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant)))}
 	f.auth = &auth{name: name, opt: opt, m: m, srv: srv, httpClient: client}
@@ -778,7 +793,10 @@ func (f *Fs) open(ctx context.Context, u *url.URL, options []fs.OpenOption) (io.
 				if err != nil {
 					return false, err
 				}
-				opts.ExtraHeaders = map[string]string{"Cookie": (&http.Cookie{Name: "JSESSIONID", Value: state.session.ID}).String()}
+				opts.ExtraHeaders = map[string]string{
+					"Cookie":     (&http.Cookie{Name: "JSESSIONID", Value: state.session.ID}).String(),
+					deviceHeader: f.opt.DeviceID,
+				}
 				if state.header != "" {
 					opts.ExtraHeaders["Authorization"] = state.header
 				}
@@ -802,6 +820,7 @@ func (f *Fs) open(ctx context.Context, u *url.URL, options []fs.OpenOption) (io.
 					req.Header.Del("Authorization")
 					req.Header.Del("Cookie")
 					req.Header.Del("Referer")
+					req.Header.Del(deviceHeader)
 				}
 				return nil
 			}
