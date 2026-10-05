@@ -70,6 +70,17 @@ The server's public system-information API supplies its upload endpoint.
 `upload_url` overrides that endpoint; otherwise uploads use `url` when the
 server does not advertise a separate upload host.
 
+O2 also supports a two-stage upload protocol used by its Windows client.
+Enable `async_upload` in advanced configuration, or use
+`--onemediahub-async-upload`. Rclone registers metadata, sends raw file
+content, then polls the server's validation status until processing completes.
+Independent files can use this protocol concurrently with `--transfers`.
+The server processing wait defaults to five minutes and can be adjusted with
+`--onemediahub-upload-timeout`. A failed or interrupted upload can leave a
+metadata-only item on the server; rclone reports the media ID in content and
+processing errors. Multipart uploads remain the default for compatibility
+with other OneMediaHub deployments.
+
 A configured remote's server can also be selected with
 `--onemediahub-url https://cloud.example.com`. Its saved credentials must
 belong to that server. Use separate remotes for separate accounts or servers.

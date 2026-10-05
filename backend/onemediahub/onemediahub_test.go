@@ -597,6 +597,252 @@ func TestUploadVisibility(t *testing.T) {
 	assert.EqualValues(t, 1, obj.Size())
 }
 
+func TestAsyncUpload(t *testing.T) {
+	for _, size := range []int{0, 5} {
+		t.Run(strconv.Itoa(size), func(t *testing.T) {
+			fx := newFixture(t)
+			content := strings.Repeat("x", size)
+			modified := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+			var stages []string
+			var metadata api.Upload
+			var polls int
+			handler := fx.server.Config.Handler
+			fx.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				action := r.URL.Query().Get("action")
+				if r.URL.Path == "/sapi/upload/file" {
+					assert.Equal(t, http.MethodPost, r.Method)
+					assert.Equal(t, "key", r.URL.Query().Get("validationkey"))
+					stages = append(stages, action)
+					if action == "save-metadata" {
+						assert.Equal(t, "application/octet-stream", r.Header.Get("Content-Type"))
+						var request struct {
+							Data api.Upload `json:"data"`
+						}
+						require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+						metadata = request.Data
+						assert.Equal(t, "file.txt", metadata.Name)
+						assert.EqualValues(t, size, metadata.Size)
+						assert.Equal(t, modified.Format(dateFormat), metadata.Modified)
+						jsonReply(t, w, map[string]any{"id": "42", "status": "U"})
+						return
+					}
+					assert.Equal(t, "save", action)
+					assert.Equal(t, "true", r.URL.Query().Get("acceptasynchronous"))
+					assert.Equal(t, "42", r.Header.Get("X-funambol-id"))
+					assert.Equal(t, strconv.Itoa(size), r.Header.Get("X-funambol-file-size"))
+					assert.EqualValues(t, size, r.ContentLength)
+					assert.Equal(t, metadata.ContentType, r.Header.Get("Content-Type"))
+					body, err := io.ReadAll(r.Body)
+					require.NoError(t, err)
+					assert.Equal(t, content, string(body))
+					fx.mu.Lock()
+					fx.media = []api.Media{{ID: "42", Name: "file.txt", Size: int64(size), Modified: modified.UnixMilli(), Type: "file", Status: "U"}}
+					fx.content["42"] = content
+					fx.mu.Unlock()
+					w.WriteHeader(http.StatusAccepted)
+					jsonReply(t, w, map[string]any{"id": 42, "status": "A"})
+					return
+				}
+				if action == "get-validation-status" {
+					assert.Equal(t, "/sapi/media", r.URL.Path)
+					assert.Equal(t, http.MethodPost, r.Method)
+					var request struct {
+						Data struct {
+							IDs []struct {
+								ID       string `json:"id"`
+								FolderID string `json:"folder_id"`
+							} `json:"ids"`
+						} `json:"data"`
+					}
+					require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+					require.Len(t, request.Data.IDs, 1)
+					assert.Equal(t, "42", request.Data.IDs[0].ID)
+					polls++
+					status := "V"
+					if polls == 1 {
+						status = "U"
+					}
+					jsonReply(t, w, map[string]any{"data": map[string]any{"ids": []map[string]any{{"id": "42", "status": status}}}})
+					return
+				}
+				handler.ServeHTTP(w, r)
+			})
+			m := fx.config(t)
+			m["async_upload"] = "true"
+			ctx := context.Background()
+			f, err := NewFs(ctx, "test", "", m)
+			require.NoError(t, err)
+			src := object.NewStaticObjectInfo("file.txt", modified, int64(size), true, nil, f)
+			obj, err := f.Put(ctx, io.NopCloser(strings.NewReader(content)), src)
+			require.NoError(t, err)
+			assert.EqualValues(t, size, obj.Size())
+			assert.True(t, modified.Equal(obj.ModTime(ctx)))
+			assert.Equal(t, []string{"save-metadata", "save"}, stages)
+			assert.Equal(t, 2, polls)
+			stages = nil
+			polls = 0
+			require.NoError(t, obj.Update(ctx, strings.NewReader(content), src))
+			assert.Equal(t, "42", metadata.ID)
+			assert.Equal(t, []string{"save-metadata", "save"}, stages)
+		})
+	}
+}
+
+func TestAsyncUploadTimeoutOption(t *testing.T) {
+	for _, timeout := range []string{"0s", "-1s"} {
+		m := testConfig(t, configmap.Simple{"async_upload": "true", "upload_timeout": timeout})
+		_, err := readOptions(m)
+		require.ErrorContains(t, err, "upload_timeout must be positive")
+	}
+}
+
+func TestAsyncUploadsParallel(t *testing.T) {
+	fx := newFixture(t)
+	var arrived atomic.Int32
+	ready := make(chan struct{})
+	upload := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/sapi/upload/file", r.URL.Path)
+		switch r.URL.Query().Get("action") {
+		case "save-metadata":
+			var request struct {
+				Data api.Upload `json:"data"`
+			}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+			fx.mu.Lock()
+			id := api.ID(strconv.Itoa(fx.nextID))
+			fx.nextID++
+			fx.media = append(fx.media, api.Media{ID: id, Name: request.Data.Name, Size: request.Data.Size, Type: "file"})
+			fx.mu.Unlock()
+			jsonReply(t, w, map[string]any{"id": id})
+		case "save":
+			if arrived.Add(1) == 2 {
+				close(ready)
+			}
+			select {
+			case <-ready:
+			case <-r.Context().Done():
+				return
+			}
+			content, err := io.ReadAll(r.Body)
+			require.NoError(t, err)
+			fx.mu.Lock()
+			fx.content[api.ID(r.Header.Get("X-funambol-id"))] = string(content)
+			fx.mu.Unlock()
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			t.Errorf("unexpected upload action %s", r.URL.Query().Get("action"))
+		}
+	}))
+	defer upload.Close()
+	handler := fx.server.Config.Handler
+	fx.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("action") != "get-validation-status" {
+			handler.ServeHTTP(w, r)
+			return
+		}
+		var request struct {
+			Data struct {
+				IDs []struct {
+					ID string `json:"id"`
+				} `json:"ids"`
+			} `json:"data"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+		require.Len(t, request.Data.IDs, 1)
+		jsonReply(t, w, map[string]any{"data": map[string]any{"ids": []map[string]string{{"id": request.Data.IDs[0].ID, "status": "V"}}}})
+	})
+	m := fx.config(t)
+	m["async_upload"], m["upload_url"] = "true", upload.URL
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	f, err := NewFs(ctx, "test", "", m)
+	require.NoError(t, err)
+	errors := make(chan error, 2)
+	for _, name := range []string{"one", "two"} {
+		go func() {
+			src := object.NewStaticObjectInfo(name+".txt", time.Now(), int64(len(name)), true, nil, f)
+			_, err := f.Put(ctx, strings.NewReader(name), src)
+			errors <- err
+		}()
+	}
+	for range 2 {
+		require.NoError(t, <-errors)
+	}
+	assert.EqualValues(t, 2, arrived.Load())
+	fx.mu.Lock()
+	defer fx.mu.Unlock()
+	for _, item := range fx.media {
+		assert.Equal(t, strings.TrimSuffix(item.Name, ".txt"), fx.content[item.ID])
+	}
+}
+
+func TestAsyncUploadErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name, metadata, content, status, want string
+	}{
+		{"metadata failure", `{"error":{"code":"COM-1011","message":"invalid metadata"}}`, "", "", "register upload metadata: COM-1011"},
+		{"missing ID", `{}`, "", "", "no media ID"},
+		{"wrong metadata ID", `{"id":43}`, "", "", "expected 42"},
+		{"content failure", `{"id":42}`, `{"error":{"code":"MED-1000","message":"upload failed"}}`, "", "upload media 42: MED-1000"},
+		{"wrong content ID", `{"id":42}`, `{"id":43}`, "", "expected 42"},
+		{"processing failure", `{"id":42}`, `{}`, `{"data":{"ids":[{"id":42,"status":"F"}]}}`, `returned status "F"`},
+		{"invalid status response", `{"id":42}`, `{}`, `{"data":[]}`, "decode upload processing status"},
+		{"accepted remains pending", `{"id":42}`, `{}`, `{"data":{"ids":[{"id":42,"status":"A"}]}}`, "context deadline exceeded"},
+		{"missing status remains pending", `{"id":42}`, `{}`, `{"data":{"ids":[]}}`, "context deadline exceeded"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newFixture(t)
+			var metadataCalls, contentCalls, statusCalls int
+			handler := fx.server.Config.Handler
+			fx.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body string
+				switch r.URL.Query().Get("action") {
+				case "save-metadata":
+					metadataCalls++
+					body = tc.metadata
+				case "save":
+					contentCalls++
+					body = tc.content
+				case "get-validation-status":
+					statusCalls++
+					body = tc.status
+				default:
+					handler.ServeHTTP(w, r)
+					return
+				}
+				_, err := io.WriteString(w, body)
+				assert.NoError(t, err)
+			})
+			m := fx.config(t)
+			m["async_upload"] = "true"
+			m["upload_timeout"] = "50ms"
+			ctx := context.Background()
+			f, err := NewFs(ctx, "test", "", m)
+			require.NoError(t, err)
+			src := object.NewStaticObjectInfo("file", time.Now(), 1, true, nil, f)
+			if tc.name == "wrong metadata ID" {
+				obj := &Object{fs: f.(*Fs), remote: "file", info: api.Media{ID: "42"}}
+				err = obj.Update(ctx, strings.NewReader("x"), src)
+				assert.Equal(t, "42", obj.ID())
+			} else {
+				_, err = f.Put(ctx, strings.NewReader("x"), src)
+			}
+			require.ErrorContains(t, err, tc.want)
+			assert.Equal(t, 1, metadataCalls)
+			if tc.content != "" {
+				assert.Equal(t, 1, contentCalls, "raw uploads must not be replayed")
+			} else {
+				assert.Zero(t, contentCalls)
+			}
+			if tc.status != "" {
+				assert.Equal(t, 1, statusCalls)
+			} else {
+				assert.Zero(t, statusCalls)
+			}
+		})
+	}
+}
+
 func TestO2RootLayout(t *testing.T) {
 	fx := newFixture(t)
 	fx.folders = []api.Folder{

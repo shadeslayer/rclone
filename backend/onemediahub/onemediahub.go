@@ -143,6 +143,18 @@ func init() {
 				Advanced: true,
 			},
 			{
+				Name:     "async_upload",
+				Help:     "Register metadata separately and upload raw content with asynchronous server processing instead of multipart uploads.",
+				Default:  false,
+				Advanced: true,
+			},
+			{
+				Name:     "upload_timeout",
+				Help:     "Maximum time to wait for asynchronous upload processing after sending content.",
+				Default:  fs.Duration(5 * time.Minute),
+				Advanced: true,
+			},
+			{
 				Name:     "upload_url",
 				Help:     "Upload server URL. Empty discovers it from the server, falling back to url.",
 				Advanced: true,
@@ -202,24 +214,26 @@ func init() {
 }
 
 type options struct {
-	URL          string               `config:"url"`
-	AuthType     string               `config:"auth_type"`
-	User         string               `config:"user"`
-	Password     string               `config:"password"`
-	ClientID     string               `config:"client_id"`
-	ClientSecret string               `config:"client_secret"`
-	AuthURL      string               `config:"auth_url"`
-	TokenURL     string               `config:"token_url"`
-	RedirectURL  string               `config:"redirect_url"`
-	Scope        string               `config:"scope"`
-	Platform     string               `config:"platform"`
-	MSISDN       string               `config:"msisdn"`
-	DeviceID     string               `config:"device_id"`
-	UserAgent    string               `config:"user_agent"`
-	UploadURL    string               `config:"upload_url"`
-	APIPath      string               `config:"api_path"`
-	RootFolderID string               `config:"root_folder_id"`
-	Enc          encoder.MultiEncoder `config:"encoding"`
+	URL           string               `config:"url"`
+	AuthType      string               `config:"auth_type"`
+	User          string               `config:"user"`
+	Password      string               `config:"password"`
+	ClientID      string               `config:"client_id"`
+	ClientSecret  string               `config:"client_secret"`
+	AuthURL       string               `config:"auth_url"`
+	TokenURL      string               `config:"token_url"`
+	RedirectURL   string               `config:"redirect_url"`
+	Scope         string               `config:"scope"`
+	Platform      string               `config:"platform"`
+	MSISDN        string               `config:"msisdn"`
+	DeviceID      string               `config:"device_id"`
+	UserAgent     string               `config:"user_agent"`
+	UploadURL     string               `config:"upload_url"`
+	AsyncUpload   bool                 `config:"async_upload"`
+	UploadTimeout fs.Duration          `config:"upload_timeout"`
+	APIPath       string               `config:"api_path"`
+	RootFolderID  string               `config:"root_folder_id"`
+	Enc           encoder.MultiEncoder `config:"encoding"`
 }
 
 func newClient(ctx context.Context, opt *options) *http.Client {
@@ -249,6 +263,9 @@ func readOptions(m configmap.Mapper) (*options, error) {
 
 	if opt.AuthType != authOAuth && opt.AuthType != authPassword {
 		return nil, errors.New("auth_type must be oauth or password")
+	}
+	if opt.AsyncUpload && opt.UploadTimeout <= 0 {
+		return nil, errors.New("upload_timeout must be positive")
 	}
 
 	if strings.ContainsAny(opt.APIPath, "?#") || strings.Contains(opt.APIPath, "://") {
@@ -946,7 +963,7 @@ func (f *Fs) open(ctx context.Context, u *url.URL, options []fs.OpenOption) (io.
 	return resp.Body, nil
 }
 
-// Update replaces content using a multipart upload with metadata.
+// Update replaces content and waits for the uploaded object to be available.
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	if src.Size() < 0 {
 		return errors.New("OneMediaHub uploads require a known size")
@@ -957,6 +974,9 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 	modified := src.ModTime(ctx).UTC().Format(dateFormat)
 	data := api.Upload{ID: string(o.info.ID), FolderID: api.ID(parent), Name: o.fs.opt.Enc.FromStandardName(leaf), Size: src.Size(), ContentType: fs.MimeType(ctx, src), Created: modified, Modified: modified}
+	if o.fs.opt.AsyncUpload {
+		return o.uploadAsync(ctx, in, data, options)
+	}
 	endpoint := "/upload"
 	if o.info.ID != "" {
 		endpoint = "/upload/file"
@@ -973,6 +993,88 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 	o.info.ID = reply.ID
 	return o.waitMetadata(ctx)
+}
+
+func (o *Object) uploadAsync(ctx context.Context, in io.Reader, data api.Upload, options []fs.OpenOption) error {
+	metadata, err := json.Marshal(map[string]any{"data": data})
+	if err != nil {
+		return err
+	}
+	opts := rest.Opts{Method: http.MethodPost, RootURL: o.fs.uploadURL, Path: "/upload/file", Parameters: url.Values{"action": {"save-metadata"}, "responsetime": {"true"}, "lastupdate": {"true"}}, ContentType: "application/octet-stream", Body: bytes.NewReader(metadata)}
+	reply, err := o.fs.call(ctx, opts, nil)
+	if err != nil {
+		return fmt.Errorf("register upload metadata: %w", err)
+	}
+	if reply.ID == "" {
+		return errors.New("upload metadata returned no media ID")
+	}
+	if o.info.ID != "" && reply.ID != o.info.ID {
+		return fmt.Errorf("upload metadata returned media ID %s, expected %s", reply.ID, o.info.ID)
+	}
+	o.info.ID = reply.ID
+	size := data.Size
+	if size == 0 {
+		// net/http treats an arbitrary reader with zero ContentLength as an unknown length.
+		in = http.NoBody
+	}
+	opts.Parameters = url.Values{"action": {"save"}, "lastupdate": {"true"}, "acceptasynchronous": {"true"}}
+	opts.Body = in
+	opts.ContentType = data.ContentType
+	opts.ContentLength = &size
+	opts.Options = options
+	opts.ExtraHeaders = map[string]string{"X-funambol-id": string(reply.ID), "X-funambol-file-size": strconv.FormatInt(size, 10)}
+	reply, err = o.fs.call(ctx, opts, nil)
+	if err != nil {
+		return fmt.Errorf("upload media %s: %w", o.info.ID, err)
+	}
+	if reply.ID != "" && reply.ID != o.info.ID {
+		return fmt.Errorf("upload returned media ID %s, expected %s", reply.ID, o.info.ID)
+	}
+	if err := o.waitUpload(ctx, data.FolderID); err != nil {
+		return err
+	}
+	return o.waitMetadata(ctx)
+}
+
+func (o *Object) waitUpload(ctx context.Context, folderID api.ID) error {
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(o.fs.opt.UploadTimeout))
+	defer cancel()
+	delay := metadataDelay
+	for {
+		request := map[string]any{"ids": []map[string]string{{"id": string(o.info.ID), "folder_id": string(folderID)}}}
+		reply, err := o.fs.request(ctx, http.MethodPost, "/media", "get-validation-status", nil, request)
+		if err != nil {
+			return fmt.Errorf("check upload processing for media %s: %w", o.info.ID, err)
+		}
+		var result struct {
+			IDs []struct {
+				ID     api.ID `json:"id"`
+				Status string `json:"status"`
+			} `json:"ids"`
+		}
+		if err := json.Unmarshal(reply.Data, &result); err != nil {
+			return fmt.Errorf("decode upload processing status: %w", err)
+		}
+		for _, item := range result.IDs {
+			if item.ID != o.info.ID {
+				continue
+			}
+			switch item.Status {
+			case "V":
+				return nil
+			case "U", "A":
+				// Acceptance does not guarantee the server has processed the content.
+			default:
+				return fmt.Errorf("upload processing for media %s returned status %q", o.info.ID, item.Status)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for upload processing for media %s: %w", o.info.ID, ctx.Err())
+		case <-time.After(delay):
+		}
+		delay = min(2*delay, metadataMaxDelay)
+	}
 }
 
 // Remove moves the media item to the trash.
