@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -18,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rclone/rclone/backend/local"
 	"github.com/rclone/rclone/backend/onemediahub/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
@@ -1173,6 +1176,200 @@ func TestAsyncUploadTimeoutOption(t *testing.T) {
 		m := testConfig(t, configmap.Simple{"async_upload": "true", "upload_timeout": timeout})
 		_, err := readOptions(m)
 		require.ErrorContains(t, err, "upload_timeout must be positive")
+	}
+}
+
+func TestAsyncUploadResume(t *testing.T) {
+	for _, fullyUploaded := range []bool{false, true} {
+		t.Run(strconv.FormatBool(fullyUploaded), func(t *testing.T) {
+			fx := newFixture(t)
+			var metadataCalls, rawCalls, probes atomic.Int32
+			var saved string
+			handler := fx.server.Config.Handler
+			fx.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				action := r.URL.Query().Get("action")
+				if r.URL.Path == "/sapi/upload/file" {
+					if action == "save-metadata" {
+						metadataCalls.Add(1)
+						jsonReply(t, w, map[string]string{"id": "42"})
+						return
+					}
+					if r.Header.Get("Content-Range") == "bytes */6" {
+						probes.Add(1)
+						assert.EqualValues(t, 0, r.ContentLength)
+						w.Header().Set("Range", "0-"+strconv.Itoa(len(saved)-1))
+						w.WriteHeader(308)
+						_, _ = io.WriteString(w, "<html>Resume</html>")
+						return
+					}
+					call := rawCalls.Add(1)
+					body, err := io.ReadAll(r.Body)
+					require.NoError(t, err)
+					if call == 1 {
+						if fullyUploaded {
+							saved = string(body)
+						} else {
+							saved = string(body[:3])
+						}
+						w.WriteHeader(503)
+						return
+					}
+					assert.Equal(t, "bytes 3-5/6", r.Header.Get("Content-Range"))
+					assert.EqualValues(t, 3, r.ContentLength)
+					assert.Equal(t, "def", string(body))
+					saved += string(body)
+					w.WriteHeader(202)
+					return
+				}
+				if action == "get-validation-status" {
+					fx.mu.Lock()
+					fx.media = []api.Media{{ID: "42", Name: "file", Size: 6, URL: fx.server.URL + "/content/42"}}
+					fx.content["42"] = saved
+					fx.mu.Unlock()
+					jsonReply(t, w, map[string]any{"data": map[string]any{"ids": []map[string]string{{"id": "42", "status": "V"}}}})
+					return
+				}
+				handler.ServeHTTP(w, r)
+			})
+			m := fx.config(t)
+			m["async_upload"] = "true"
+			ctx := context.Background()
+			remote, err := NewFs(ctx, "resume", "", m)
+			require.NoError(t, err)
+			f := remote.(*Fs)
+			t.Cleanup(func() { require.NoError(t, f.Shutdown(ctx)) })
+			src := object.NewStaticObjectInfo("file", time.Now(), 6, true, nil, f)
+			o, err := f.Put(ctx, strings.NewReader("abcdef"), src)
+			require.NoError(t, err)
+			assert.Equal(t, "abcdef", saved)
+			assert.Equal(t, "42", o.(*Object).ID())
+			assert.EqualValues(t, 1, metadataCalls.Load())
+			assert.EqualValues(t, 1, probes.Load())
+			if fullyUploaded {
+				assert.EqualValues(t, 1, rawCalls.Load())
+			} else {
+				assert.EqualValues(t, 2, rawCalls.Load())
+			}
+		})
+	}
+}
+
+func TestAsyncUploadResumeRejectsUnsafeOffsets(t *testing.T) {
+	for _, tc := range []struct {
+		name, rangeValue, want string
+		seekable               bool
+	}{
+		{"missing", "", "invalid Range", true}, {"nonzero start", "1-2", "invalid Range", true}, {"beyond size", "0-9", "invalid Range", true}, {"negative end", "0--1", "invalid Range", true}, {"multiple ranges", "0-2,4-5", "invalid Range", true}, {"non-seekable", "0-2", "non-seekable", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newFixture(t)
+			var rawCalls atomic.Int32
+			handler := fx.server.Config.Handler
+			fx.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/sapi/upload/file" {
+					handler.ServeHTTP(w, r)
+					return
+				}
+				if r.URL.Query().Get("action") == "save-metadata" {
+					jsonReply(t, w, map[string]string{"id": "42"})
+					return
+				}
+				if r.Header.Get("Content-Range") == "bytes */6" {
+					w.Header().Set("Range", tc.rangeValue)
+					w.WriteHeader(308)
+					return
+				}
+				rawCalls.Add(1)
+				_, err := io.Copy(io.Discard, r.Body)
+				require.NoError(t, err)
+				w.WriteHeader(503)
+			})
+			m := fx.config(t)
+			m["async_upload"] = "true"
+			ctx := context.Background()
+			remote, err := NewFs(ctx, "unsafe-resume", "", m)
+			require.NoError(t, err)
+			f := remote.(*Fs)
+			t.Cleanup(func() { require.NoError(t, f.Shutdown(ctx)) })
+			var reader io.Reader = strings.NewReader("abcdef")
+			if !tc.seekable {
+				reader = io.NopCloser(reader)
+			}
+			src := object.NewStaticObjectInfo("file", time.Now(), 6, true, nil, f)
+			_, err = f.Put(ctx, reader, src)
+			require.ErrorContains(t, err, tc.want)
+			assert.EqualValues(t, 1, rawCalls.Load())
+		})
+	}
+}
+
+func TestAsyncUploadResumeSource(t *testing.T) {
+	for _, changed := range []bool{false, true} {
+		t.Run(strconv.FormatBool(changed), func(t *testing.T) {
+			ctx := context.Background()
+			sourceDir := t.TempDir()
+			sourcePath := filepath.Join(sourceDir, "source.txt")
+			require.NoError(t, os.WriteFile(sourcePath, []byte("abcdef"), 0600))
+			modified := time.Unix(1700000000, 100000000)
+			require.NoError(t, os.Chtimes(sourcePath, modified, modified))
+			sourceFs, err := local.NewFs(ctx, "source", sourceDir, configmap.Simple{})
+			require.NoError(t, err)
+			src, err := sourceFs.NewObject(ctx, "source.txt")
+			require.NoError(t, err)
+			fx := newFixture(t)
+			var rawCalls atomic.Int32
+			handler := fx.server.Config.Handler
+			fx.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				action := r.URL.Query().Get("action")
+				if r.URL.Path == "/sapi/upload/file" {
+					if action == "save-metadata" {
+						jsonReply(t, w, map[string]string{"id": "42"})
+						return
+					}
+					if r.Header.Get("Content-Range") == "bytes */6" {
+						w.Header().Set("Range", "bytes=0-2")
+						w.WriteHeader(308)
+						return
+					}
+					body, err := io.ReadAll(r.Body)
+					require.NoError(t, err)
+					if rawCalls.Add(1) == 1 {
+						if changed {
+							require.NoError(t, os.WriteFile(sourcePath, []byte("ABCDEF"), 0600))
+							require.NoError(t, os.Chtimes(sourcePath, modified.Add(100*time.Millisecond), modified.Add(100*time.Millisecond)))
+						}
+						w.WriteHeader(503)
+						return
+					}
+					assert.Equal(t, "def", string(body))
+					w.WriteHeader(202)
+					return
+				}
+				if action == "get-validation-status" {
+					fx.mu.Lock()
+					fx.media = []api.Media{{ID: "42", Name: "file", Size: 6}}
+					fx.mu.Unlock()
+					jsonReply(t, w, map[string]any{"data": map[string]any{"ids": []map[string]string{{"id": "42", "status": "V"}}}})
+					return
+				}
+				handler.ServeHTTP(w, r)
+			})
+			m := fx.config(t)
+			m["async_upload"] = "true"
+			remote, err := NewFs(ctx, "source-resume", "", m)
+			require.NoError(t, err)
+			f := remote.(*Fs)
+			t.Cleanup(func() { require.NoError(t, f.Shutdown(ctx)) })
+			o := &Object{fs: f, remote: "file"}
+			err = o.Update(ctx, io.NopCloser(strings.NewReader("abcdef")), src)
+			if changed {
+				require.ErrorContains(t, err, "source changed")
+				assert.EqualValues(t, 1, rawCalls.Load())
+			} else {
+				require.NoError(t, err)
+				assert.EqualValues(t, 2, rawCalls.Load())
+			}
+		})
 	}
 }
 

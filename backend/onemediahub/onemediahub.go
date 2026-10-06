@@ -26,6 +26,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/rclone/rclone/backend/onemediahub/api"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
@@ -38,6 +39,7 @@ import (
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/kv"
 	"github.com/rclone/rclone/lib/pacer"
+	"github.com/rclone/rclone/lib/readers"
 	"github.com/rclone/rclone/lib/rest"
 	"golang.org/x/sync/singleflight"
 )
@@ -547,6 +549,9 @@ func (f *Fs) send(ctx context.Context, opts rest.Opts, request any, state authSt
 	}
 
 	if err == nil {
+		if opts.NoResponse {
+			return reply, resp, nil
+		}
 		b, readErr := rest.ReadBody(resp)
 		err = readErr
 		if err == nil && len(strings.TrimSpace(string(b))) != 0 {
@@ -1635,7 +1640,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	modified := src.ModTime(ctx).UTC().Format(dateFormat)
 	data := api.Upload{ID: string(o.info.ID), FolderID: api.ID(parent), Name: o.fs.opt.Enc.FromStandardName(leaf), Size: src.Size(), ContentType: fs.MimeType(ctx, src), Created: modified, Modified: modified}
 	if o.fs.opt.AsyncUpload {
-		return o.uploadAsync(ctx, in, data, options)
+		return o.uploadAsync(ctx, in, data, options, src)
 	}
 	endpoint := "/upload"
 	if o.info.ID != "" {
@@ -1655,7 +1660,8 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	return o.waitMetadata(ctx)
 }
 
-func (o *Object) uploadAsync(ctx context.Context, in io.Reader, data api.Upload, options []fs.OpenOption) error {
+func (o *Object) uploadAsync(ctx context.Context, in io.Reader, data api.Upload, options []fs.OpenOption, src fs.ObjectInfo) error {
+	originalModTime := src.ModTime(ctx)
 	metadata, err := json.Marshal(map[string]any{"data": data})
 	if err != nil {
 		return err
@@ -1683,9 +1689,79 @@ func (o *Object) uploadAsync(ctx context.Context, in io.Reader, data api.Upload,
 	opts.ContentLength = &size
 	opts.Options = options
 	opts.ExtraHeaders = map[string]string{"X-funambol-id": string(reply.ID), "X-funambol-file-size": strconv.FormatInt(size, 10)}
-	reply, err = o.fs.call(ctx, opts, nil)
-	if err != nil {
-		return fmt.Errorf("upload media %s: %w", o.info.ID, err)
+	unwrapped, wrap := accounting.UnWrap(in)
+	seeker, canSeek := unwrapped.(io.ReadSeeker)
+	var baseOffset int64
+	if canSeek {
+		baseOffset, err = seeker.Seek(0, io.SeekCurrent)
+		canSeek = err == nil
+	}
+	var reopened io.ReadCloser
+	defer func() {
+		if reopened != nil {
+			_ = reopened.Close()
+		}
+	}()
+	var offset, available int64
+	for attempt := 0; ; attempt++ {
+		counter := readers.NewCountingReader(opts.Body)
+		if size != 0 {
+			opts.Body = counter
+		}
+		reply, err = o.fs.call(ctx, opts, nil)
+		available = max(available, offset+int64(counter.BytesRead()))
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil || attempt+1 >= max(1, fs.GetConfig(ctx).LowLevelRetries) || !fserrors.IsRetryError(err) && !fserrors.ShouldRetry(err) {
+			return fmt.Errorf("upload media %s: %w", o.info.ID, err)
+		}
+		confirmed, probeErr := o.uploadOffset(ctx, size)
+		if probeErr != nil {
+			return fmt.Errorf("resume upload media %s after %v: %w", o.info.ID, err, probeErr)
+		}
+		if confirmed > available {
+			return errors.New("upload offset exceeds bytes sent")
+		}
+		offset = confirmed
+		if source, ok := src.(fs.Object); ok {
+			if sourceFs, ok := source.Fs().(fs.Fs); ok {
+				fresh, err := sourceFs.NewObject(ctx, source.Remote())
+				if err != nil {
+					return fmt.Errorf("check upload source: %w", err)
+				}
+				if fresh.Size() != data.Size || !fresh.ModTime(ctx).Equal(originalModTime) {
+					return errors.New("upload source changed before resuming")
+				}
+			}
+		}
+		if offset == size {
+			break
+		}
+		if canSeek {
+			position, err := seeker.Seek(baseOffset+offset, io.SeekStart)
+			if err != nil {
+				return fmt.Errorf("seek upload source: %w", err)
+			}
+			if position != baseOffset+offset {
+				return errors.New("upload source returned an unexpected seek position")
+			}
+			opts.Body = wrap(seeker)
+		} else if source, ok := src.(fs.Object); ok {
+			if reopened != nil {
+				_ = reopened.Close()
+			}
+			reopened, err = source.Open(ctx, &fs.SeekOption{Offset: offset})
+			if err != nil {
+				return fmt.Errorf("reopen upload source: %w", err)
+			}
+			opts.Body = wrap(reopened)
+		} else {
+			return fmt.Errorf("cannot resume upload from a non-seekable source: %w", err)
+		}
+		remaining := size - offset
+		opts.ContentLength = &remaining
+		opts.ContentRange = fmt.Sprintf("bytes %d-%d/%d", offset, size-1, size)
 	}
 	if reply.ID != "" && reply.ID != o.info.ID {
 		return fmt.Errorf("upload returned media ID %s, expected %s", reply.ID, o.info.ID)
@@ -1694,6 +1770,43 @@ func (o *Object) uploadAsync(ctx context.Context, in io.Reader, data api.Upload,
 		return err
 	}
 	return o.waitMetadata(ctx)
+}
+
+func (o *Object) uploadOffset(ctx context.Context, size int64) (int64, error) {
+	zero := int64(0)
+	opts := rest.Opts{Method: http.MethodPost, RootURL: o.fs.uploadURL, Path: "/upload/file", Parameters: url.Values{"action": {"save"}, "lastupdate": {"true"}, "acceptasynchronous": {"true"}}, Body: http.NoBody, ContentLength: &zero, ContentRange: fmt.Sprintf("bytes */%d", size), IgnoreStatus: true, NoResponse: true, ExtraHeaders: map[string]string{"X-funambol-id": string(o.info.ID), "X-funambol-file-size": strconv.FormatInt(size, 10)}}
+	var offset int64
+	err := o.fs.pacer.Call(func() (bool, error) {
+		for attempt := range maxAuthAttempts {
+			state, err := o.fs.auth.prepare(ctx)
+			if err != nil {
+				return false, err
+			}
+			_, resp, err := o.fs.send(ctx, opts, nil, state)
+			if resp != nil && resp.StatusCode == http.StatusUnauthorized {
+				o.fs.auth.invalidate(state.session)
+				if attempt == 0 {
+					continue
+				}
+			}
+			if err != nil {
+				return retry(ctx, resp, err)
+			}
+			if resp.StatusCode != 308 && (resp.StatusCode < 200 || resp.StatusCode >= 300) {
+				return retry(ctx, resp, fmt.Errorf("upload offset probe: HTTP %s", resp.Status))
+			}
+			rangeValue := strings.TrimPrefix(strings.TrimSpace(resp.Header.Get("Range")), "bytes=")
+			start, end, ok := strings.Cut(rangeValue, "-")
+			last, parseErr := strconv.ParseInt(end, 10, 64)
+			if !ok || start != "0" || parseErr != nil || last < 0 || last >= size {
+				return false, errors.New("upload offset probe returned an invalid Range")
+			}
+			offset = last + 1
+			return false, nil
+		}
+		return false, errors.New("upload offset session renewal failed")
+	})
+	return offset, err
 }
 
 func (o *Object) waitUpload(ctx context.Context, folderID api.ID) error {
