@@ -486,6 +486,9 @@ func resolveExitCode(err error) {
 	ci := fs.GetConfig(ctx)
 	atexit.Run()
 	if err == nil {
+		err = accounting.GlobalStats().GetLastError()
+	}
+	if err == nil {
 		if ci.ErrorOnNoTransfer {
 			if accounting.GlobalStats().GetTransfers() == 0 {
 				os.Exit(exitcode.NoFilesTransferred)
