@@ -33,11 +33,13 @@ import (
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/batcher"
+	"github.com/rclone/rclone/lib/cache"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/kv"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -304,6 +306,8 @@ func readOptions(m configmap.Mapper) (*options, error) {
 
 // Fs represents a OneMediaHub remote.
 type Fs struct {
+	downloadURLs     *cache.Cache
+	downloadRefresh  singleflight.Group
 	validation       *batcher.Batcher[validationItem, string]
 	validationCancel context.CancelFunc
 	uploadURL        string
@@ -350,7 +354,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	base := strings.TrimRight(opt.URL, "/") + "/" + strings.Trim(opt.APIPath, "/")
 	client := newClient(ctx, opt)
 	srv := rest.NewClient(client).SetRoot(base).SetHeader(deviceHeader, opt.DeviceID).SetErrorHandler(errorHandler)
-	f := &Fs{name: name, root: strings.Trim(root, "/"), opt: opt, srv: srv, download: rest.NewClient(client),
+	f := &Fs{name: name, root: strings.Trim(root, "/"), opt: opt, srv: srv, download: rest.NewClient(client), downloadURLs: cache.New(),
 		pacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant)))}
 	f.auth = &auth{name: name, opt: opt, m: m, srv: srv, httpClient: client}
 	f.features = (&fs.Features{CanHaveEmptyDirectories: true}).Fill(ctx, f)
@@ -609,6 +613,9 @@ func (f *Fs) mediaKey(item api.Media) mediaKey {
 }
 
 func (f *Fs) cacheMedia(item api.Media, remove bool) {
+	if f.downloadURLs != nil {
+		f.downloadURLs.DeletePrefix(string(item.ID) + "/")
+	}
 	if c := f.metadata; c != nil {
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -875,6 +882,14 @@ func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
 	if c.db != nil {
 		if err := c.db.Do(true, &metadataOp{state: next, write: true}); err != nil {
 			return false, fmt.Errorf("save metadata cache: %w", err)
+		}
+	}
+	for source, change := range changes {
+		if source == "folder" {
+			continue
+		}
+		for _, id := range slices.Concat(change.New, change.Updated, change.Deleted, change.Locked) {
+			f.downloadURLs.DeletePrefix(string(id) + "/")
 		}
 	}
 	c.state = next
@@ -1300,25 +1315,77 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	// Range downloads may open the same object concurrently.
 	snapshot := *o
 	o = &snapshot
-	if err := o.refresh(ctx); err != nil {
-		return nil, err
-	}
-
 	// Some providers have no downloadable blob for a stored empty file.
 	if o.Size() == 0 {
 		return io.NopCloser(strings.NewReader("")), nil
 	}
-	u, err := url.Parse(o.info.URL)
-	if err != nil || o.info.URL == "" {
-		return nil, errors.New("invalid media download URL")
+	key := fmt.Sprintf("%s/%d/%d/%d", o.info.ID, o.info.Size, o.info.Modified, o.info.Date)
+	rawURL := o.info.URL
+	if cached, ok := o.fs.downloadURLs.GetMaybe(key); ok {
+		rawURL = cached.(string)
 	}
-	base, _ := url.Parse(o.fs.opt.URL + "/")
-	u = base.ResolveReference(u)
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return nil, errors.New("unsupported download URL scheme")
+	var err error
+	if rawURL == "" {
+		rawURL, err = o.refreshDownloadURL(ctx, key, "")
+		if err != nil {
+			return nil, err
+		}
 	}
+	options = slices.Clone(options)
 	fs.FixRangeOption(options, o.Size())
-	return o.fs.open(ctx, u, options)
+	for attempt := range 2 {
+		u, err := url.Parse(rawURL)
+		if err != nil || rawURL == "" {
+			return nil, errors.New("invalid media download URL")
+		}
+		base, _ := url.Parse(o.fs.opt.URL + "/")
+		u = base.ResolveReference(u)
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return nil, errors.New("unsupported download URL scheme")
+		}
+		body, err := o.fs.open(ctx, u, options)
+		if attempt != 0 || !errors.Is(err, errDownloadURLExpired) {
+			return body, err
+		}
+		rawURL, err = o.refreshDownloadURL(ctx, key, rawURL)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return nil, errDownloadURLExpired
+}
+
+var errDownloadURLExpired = errors.New("expired media download URL")
+
+func (o *Object) refreshDownloadURL(ctx context.Context, key, expired string) (string, error) {
+	result := o.fs.downloadRefresh.DoChan(key, func() (any, error) {
+		if cached, ok := o.fs.downloadURLs.GetMaybe(key); ok && cached.(string) != expired {
+			return cached, nil
+		}
+		lookupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), metadataTimeout)
+		defer cancel()
+		snapshot := *o
+		if err := snapshot.refresh(lookupCtx); err != nil {
+			return nil, err
+		}
+		if snapshot.info.Size != o.info.Size || o.info.Modified != 0 && snapshot.info.Modified != o.info.Modified {
+			return nil, errors.New("media changed while opening download")
+		}
+		if snapshot.info.URL == "" {
+			return nil, errors.New("media has no download URL")
+		}
+		o.fs.downloadURLs.Put(key, snapshot.info.URL)
+		return snapshot.info.URL, nil
+	})
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case refreshed := <-result:
+		if refreshed.Err != nil {
+			return "", refreshed.Err
+		}
+		return refreshed.Val.(string), nil
+	}
 }
 
 func downloadError(resp *http.Response) error {
@@ -1419,6 +1486,9 @@ func (f *Fs) open(ctx context.Context, u *url.URL, options []fs.OpenOption) (io.
 		return false, errors.New("download session renewal failed")
 	})
 	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusForbidden && resp.Request != nil && !isAPI(resp.Request.URL) {
+			return nil, fmt.Errorf("%w: %w", errDownloadURLExpired, err)
+		}
 		return nil, err
 	}
 	return resp.Body, nil
@@ -1426,6 +1496,7 @@ func (f *Fs) open(ctx context.Context, u *url.URL, options []fs.OpenOption) (io.
 
 // Update replaces content and waits for the uploaded object to be available.
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
+	o.fs.downloadURLs.DeletePrefix(string(o.info.ID) + "/")
 	defer func() {
 		if err != nil {
 			o.fs.expireMetadata()
@@ -1609,6 +1680,7 @@ func (f *Fs) checkUploads(ctx context.Context, items []validationItem, results [
 
 // Remove moves the media item to the trash.
 func (o *Object) Remove(ctx context.Context) error {
+	o.fs.downloadURLs.DeletePrefix(string(o.info.ID) + "/")
 	var field string
 	switch o.info.Type {
 	case "picture":

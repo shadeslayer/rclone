@@ -1829,6 +1829,80 @@ func TestConcurrentOpen(t *testing.T) {
 		})
 	}
 	wg.Wait()
+	fx.mu.Lock()
+	assert.Equal(t, 1, fx.requests["/sapi/media"], "range openings reuse the listed download URL")
+	fx.mu.Unlock()
+}
+
+func TestDownloadURLExpiry(t *testing.T) {
+	for _, apiForbidden := range []bool{false, true} {
+		t.Run(strconv.FormatBool(apiForbidden), func(t *testing.T) {
+			fx := newFixture(t)
+			var oldCalls atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/expired" || r.URL.Path == "/sapi/forbidden" {
+					oldCalls.Add(1)
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+				fx.serve(t, w, r)
+			}))
+			defer srv.Close()
+			oldPath := "/expired"
+			if apiForbidden {
+				oldPath = "/sapi/forbidden"
+			}
+			fx.media = []api.Media{{ID: "1", Name: "file", Size: 6, URL: srv.URL + oldPath}}
+			fx.content["1"] = "abcdef"
+			m := fx.config(t)
+			m["url"] = srv.URL
+			remote, err := NewFs(context.Background(), "expiry", "", m)
+			require.NoError(t, err)
+			obj, err := remote.NewObject(context.Background(), "file")
+			require.NoError(t, err)
+			fx.mu.Lock()
+			fx.media[0].URL = srv.URL + "/content/1"
+			fx.mu.Unlock()
+			for range 2 {
+				body, err := obj.Open(context.Background(), &fs.RangeOption{Start: 1, End: 3})
+				if apiForbidden {
+					require.Error(t, err)
+					continue
+				}
+				require.NoError(t, err)
+				b, err := io.ReadAll(body)
+				require.NoError(t, err)
+				require.NoError(t, body.Close())
+				assert.Equal(t, "bcd", string(b))
+			}
+			fx.mu.Lock()
+			defer fx.mu.Unlock()
+			if apiForbidden {
+				assert.Equal(t, 1, fx.requests["/sapi/media"])
+				assert.EqualValues(t, 2, oldCalls.Load())
+			} else {
+				assert.Equal(t, 2, fx.requests["/sapi/media"])
+				assert.EqualValues(t, 1, oldCalls.Load())
+			}
+		})
+	}
+}
+
+func TestDownloadExpiryContentChange(t *testing.T) {
+	fx := newFixture(t)
+	expired := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusForbidden) }))
+	defer expired.Close()
+	fx.media = []api.Media{{ID: "1", Name: "file", Size: 1, URL: expired.URL}}
+	remote, err := NewFs(context.Background(), "content-change", "", fx.config(t))
+	require.NoError(t, err)
+	obj, err := remote.NewObject(context.Background(), "file")
+	require.NoError(t, err)
+	fx.mu.Lock()
+	fx.media[0].Size = 2
+	fx.media[0].URL = fx.server.URL + "/content/1"
+	fx.mu.Unlock()
+	_, err = obj.Open(context.Background())
+	require.ErrorContains(t, err, "media changed")
 }
 
 func TestDownloadRenewal(t *testing.T) {
