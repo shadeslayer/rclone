@@ -107,6 +107,27 @@ deleted. Other failures, including network, quota and permission errors,
 are returned without retrying the batch. Folder deletion continues to
 require an empty folder.
 
+Enable `--onemediahub-async-delete` to queue deletions and submit batches in
+the background. Async batches use `delete_batch_size` directly, up to 1,000
+entries, independently of `--checkers`. The bounded queue waits for space
+when full. Commands drain pending work before exiting; a failed deletion
+is logged per file and makes the command fail. Listings, reads, uploads and
+folder operations on the same filesystem wait for earlier queued deletions.
+Queues belong to individual filesystems. Drain the originating filesystem
+before accessing overlapping paths through another root or alias, even if
+`Remove` has returned successfully. Progress counts queue
+admissions, and accepted work finishes even after its caller context ends.
+The queue is held in memory and cannot resume after forced termination.
+Mount, serve and RC requests cannot return delayed errors to the original
+caller; embedded users must call the backend's `Shutdown` to confirm completion.
+
+With `--onemediahub-metadata-cache`, a failed or ambiguous deletion batch
+can use the changes API to confirm individual deletions before reporting
+results or retrying already-trashed members. Only explicit deletion or trash
+changes confirm success; missing IDs remain unconfirmed. This check reuses
+the cache cursor without advancing it, so other metadata changes are retained.
+Successful deletion responses do not need an additional changes request.
+
 A configured remote's server can also be selected with
 `--onemediahub-url https://cloud.example.com`. Its saved credentials must
 belong to that server. Use separate remotes for separate accounts or servers.

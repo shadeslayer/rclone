@@ -176,8 +176,14 @@ func init() {
 			},
 			{
 				Name:     "delete_batch_size",
-				Help:     "Maximum number of file deletions to batch, from 1 to 1000. Batching is synchronous and groups files by media type. Actual batches are limited by --checkers; smaller batches flush after 20 ms of inactivity. Set to 1 to send individual requests.",
+				Help:     "Maximum number of file deletions to batch, from 1 to 1000. Files are grouped by media type. Synchronous batches are limited by --checkers; asynchronous batches use this size directly. Smaller batches flush after 20 ms of inactivity. Set to 1 to send individual requests.",
 				Default:  deleteBatchLimit,
+				Advanced: true,
+			},
+			{
+				Name:     "async_delete",
+				Help:     "Queue file deletions in memory and process batches in the background. Remove reports queue admission; commands drain the queue before exit and fail on background errors. Reads, uploads and folder operations on the same filesystem wait for pending deletions. Drain the originating filesystem before accessing overlapping paths through another root or alias. Accepted deletions finish even if their caller context ends. Progress counts queued files. The queue does not survive forced termination. Mount, serve, RC and library callers must explicitly drain or shut down the backend to receive delayed failures.",
+				Default:  false,
 				Advanced: true,
 			},
 			{
@@ -285,6 +291,7 @@ type options struct {
 	MetadataCache     bool                 `config:"metadata_cache"`      // MetadataCache enables account metadata caching.
 	MetadataCacheTime fs.Duration          `config:"metadata_cache_time"` // MetadataCacheTime is the interval between changes API refreshes.
 	DeleteBatchSize   int                  `config:"delete_batch_size"`
+	AsyncDelete       bool                 `config:"async_delete"`
 	APIPath           string               `config:"api_path"`
 	RootFolderID      string               `config:"root_folder_id"`
 	FlatNamespace     bool                 `config:"flat_namespace"` // FlatNamespace stores a virtual tree in encoded media names.
@@ -359,6 +366,10 @@ type Fs struct {
 	validation       *batcher.Batcher[validationItem, string]
 	validationCancel context.CancelFunc
 	deletions        *batcher.Batcher[deleteItem, error]
+	deleteMu         sync.Mutex
+	deletePending    int
+	deleteCause      error
+	deleteError      error
 	uploadURL        string
 	name             string
 	root             string
@@ -480,8 +491,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			return nil, err
 		}
 	}
+	deleteMode, deleteSize := "sync", min(opt.DeleteBatchSize, max(1, fs.GetConfig(ctx).Checkers))
+	if opt.AsyncDelete {
+		deleteMode, deleteSize = "async", opt.DeleteBatchSize
+	}
 	f.deletions, err = batcher.New(ctx, f, f.commitDeletes, batcher.Options{
-		Mode: "sync", Size: min(opt.DeleteBatchSize, max(1, fs.GetConfig(ctx).Checkers)),
+		Mode: deleteMode, Size: deleteSize,
 		MaxBatchSize: deleteBatchLimit, Timeout: 20 * time.Millisecond,
 	})
 	if err != nil {
@@ -1059,7 +1074,7 @@ func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
 	for batch := range slices.Chunk(ordered, pageSize) {
 		if err := f.fetchMedia(ctx, batch, true, func(item api.Media) error {
 			old, found := next.Media[item.ID]
-			if item.SoftDeleted || item.Status == statusDeleted {
+			if item.SoftDeleted || item.Status == statusDeleted || item.Status == "S" {
 				delete(next.Media, item.ID)
 				delete(ids, item.ID)
 				metadataChanged = metadataChanged || found
@@ -1128,7 +1143,10 @@ func (f *Fs) Shutdown(ctx context.Context) error {
 	if f.validation != nil {
 		f.validation.Shutdown()
 	}
-	err := f.stopUploadJournal()
+	err := f.asyncDeleteError(ctx)
+	if closeErr := f.stopUploadJournal(); closeErr != nil {
+		err = errors.Join(err, closeErr)
+	}
 	if c := f.metadata; c != nil {
 		c.refreshMu.Lock()
 		defer c.refreshMu.Unlock()
@@ -1136,9 +1154,13 @@ func (f *Fs) Shutdown(ctx context.Context) error {
 		defer c.mu.Unlock()
 		if c.db != nil && !c.db.IsStopped() {
 			if c.dirty {
-				err = errors.Join(err, c.db.Do(true, &metadataOp{state: c.state, write: true}))
+				if saveErr := c.db.Do(true, &metadataOp{state: c.state, write: true}); saveErr != nil {
+					err = errors.Join(err, saveErr)
+				}
 			}
-			err = errors.Join(err, c.db.Stop(false))
+			if closeErr := c.db.Stop(false); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
 			c.db = nil
 			return err
 		}
@@ -1271,7 +1293,7 @@ func (f *Fs) fetchMedia(ctx context.Context, ids []api.ID, includeDeleted bool, 
 			return err
 		}
 		for _, item := range result.Media {
-			if !includeDeleted && (item.SoftDeleted || item.Status == statusDeleted) {
+			if !includeDeleted && (item.SoftDeleted || item.Status == statusDeleted || item.Status == "S") {
 				continue
 			}
 
@@ -2089,11 +2111,14 @@ func (f *Fs) flatRmdir(ctx context.Context, dir string) error {
 			return err
 		}
 	}
-	return nil
+	return f.flushDeletions(ctx)
 }
 
 // List lists the files and directories in dir.
 func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
+	if err := f.flushDeletions(ctx); err != nil {
+		return nil, err
+	}
 	if f.opt.FlatNamespace {
 		tree, err := f.flatTree(ctx)
 		if err != nil {
@@ -2179,6 +2204,9 @@ func (f *Fs) folderPaths(ctx context.Context, folders []api.Folder, parent api.I
 
 // ListR lists files and directories recursively below dir.
 func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) error {
+	if err := f.flushDeletions(ctx); err != nil {
+		return err
+	}
 	if f.opt.FlatNamespace {
 		tree, err := f.flatTree(ctx)
 		if err != nil {
@@ -2480,6 +2508,9 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 }
 
 func (f *Fs) newObject(ctx context.Context, remote string, includePending bool) (fs.Object, error) {
+	if err := f.flushDeletions(ctx); err != nil {
+		return nil, err
+	}
 	if err := f.syncMetadata(ctx); err != nil {
 		return nil, err
 	}
@@ -2544,6 +2575,9 @@ func (f *Fs) objectByName(ctx context.Context, remote, leaf, parent string, pend
 
 // Mkdir creates dir and its missing parents.
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
+	if err := f.flushDeletions(ctx); err != nil {
+		return err
+	}
 	if err := f.syncMetadata(ctx); err != nil {
 		return err
 	}
@@ -2560,6 +2594,9 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 
 // Rmdir removes an empty directory, returning ErrorDirectoryNotEmpty otherwise.
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
+	if err := f.flushDeletions(ctx); err != nil {
+		return err
+	}
 	if f.opt.FlatNamespace {
 		return f.flatRmdir(ctx, dir)
 	}
@@ -2605,6 +2642,14 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	srcFs, ok := src.(*Fs)
 	if !ok || f.opt.FlatNamespace || srcFs.opt.FlatNamespace || strings.TrimRight(f.opt.URL, "/") != strings.TrimRight(srcFs.opt.URL, "/") || f.opt.APIPath != srcFs.opt.APIPath {
 		return fs.ErrorCantDirMove
+	}
+	if err := srcFs.flushDeletions(ctx); err != nil {
+		return err
+	}
+	if srcFs != f {
+		if err := f.flushDeletions(ctx); err != nil {
+			return err
+		}
 	}
 	if srcFs != f {
 		srcAccount, err := srcFs.accountID(ctx)
@@ -2720,6 +2765,9 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, opts ...f
 
 // About returns the user's storage quota.
 func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
+	if err := f.flushDeletions(ctx); err != nil {
+		return nil, err
+	}
 	reply, err := f.request(ctx, http.MethodGet, "/media", "get-storage-space", nil, nil)
 	if err != nil {
 		return nil, err
@@ -2819,6 +2867,15 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	// Range downloads may open the same object concurrently.
 	snapshot := *o
 	o = &snapshot
+	if err := o.fs.flushDeletions(ctx); err != nil {
+		return nil, err
+	}
+	if o.fs.opt.AsyncDelete {
+		existing := *o
+		if err := existing.refresh(ctx); err != nil {
+			return nil, err
+		}
+	}
 	// Some providers have no downloadable blob for a stored empty file.
 	if o.Size() == 0 {
 		return io.NopCloser(strings.NewReader("")), nil
@@ -3010,6 +3067,14 @@ func (f *Fs) open(ctx context.Context, u *url.URL, options []fs.OpenOption) (io.
 
 // Update replaces content and waits for the uploaded object to be available.
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
+	if err := o.fs.flushDeletions(ctx); err != nil {
+		return err
+	}
+	if o.fs.opt.AsyncDelete && o.info.ID != "" {
+		if err := o.refresh(ctx); err != nil {
+			return err
+		}
+	}
 	if err := checkResumeUploadOptions(ctx, o.fs.opt); err != nil {
 		return err
 	}
@@ -3800,7 +3865,7 @@ func (f *Fs) checkUploads(ctx context.Context, items []validationItem, results [
 	return nil
 }
 
-// Remove moves the media item to the trash.
+// Remove moves the media item to the trash. With async_delete, success confirms queue admission.
 func (o *Object) Remove(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -3811,19 +3876,52 @@ func (o *Object) Remove(ctx context.Context) error {
 	default:
 		return fmt.Errorf("unsupported media type %q", o.info.Type)
 	}
-	result, err := o.fs.deletions.Commit(ctx, o.remote, deleteItem{ctx: ctx, info: o.info})
+	item := deleteItem{ctx: ctx, info: o.info, remote: o.remote}
+	if o.fs.opt.AsyncDelete {
+		if err := o.fs.asyncDeleteError(ctx); err != nil {
+			return err
+		}
+		o.fs.deleteMu.Lock()
+		o.fs.deletePending++
+		o.fs.deleteMu.Unlock()
+		// Sync cancels its worker context after admitting the last deletion.
+		item.ctx = context.WithoutCancel(ctx)
+	}
+	result, err := o.fs.deletions.Commit(ctx, o.remote, item)
 	if err != nil {
+		if o.fs.opt.AsyncDelete {
+			o.fs.deleteMu.Lock()
+			o.fs.deletePending--
+			o.fs.deleteMu.Unlock()
+		}
 		return err
 	}
 	return result
 }
 
 type deleteItem struct {
-	ctx  context.Context
-	info api.Media
+	ctx    context.Context
+	info   api.Media
+	remote string
+	done   chan error
 }
 
 func (f *Fs) commitDeletes(_ context.Context, items []deleteItem, results []error, _ []error) error {
+	start := 0
+	for i, item := range items {
+		if item.done == nil {
+			continue
+		}
+		f.commitDeleteItems(items[start:i], results[start:i])
+		item.done <- f.asyncDeleteError(item.ctx)
+		start = i + 1
+	}
+	f.commitDeleteItems(items[start:], results[start:])
+	// Errors are results so the shared batcher does not label deletions as uploads.
+	return nil
+}
+
+func (f *Fs) commitDeleteItems(items []deleteItem, results []error) {
 	groups := map[string][]int{}
 	for i, item := range items {
 		results[i] = item.ctx.Err()
@@ -3849,8 +3947,55 @@ func (f *Fs) commitDeletes(_ context.Context, items []deleteItem, results []erro
 			f.deleteMediaBatch(ctx, items, indexes, results)
 		}()
 	}
-	// Errors are results so the shared batcher does not label deletions as uploads.
-	return nil
+	if f.opt.AsyncDelete {
+		for i, result := range results {
+			var cause, reported error
+			if result != nil {
+				cause = fserrors.FatalError(fmt.Errorf("asynchronous deletion of %q: %w", items[i].remote, result))
+				reported = fs.CountError(items[i].ctx, cause)
+				fs.Errorf(f, "%v", cause)
+			}
+			f.deleteMu.Lock()
+			f.deletePending--
+			if cause != nil {
+				f.deleteCause, f.deleteError = cause, reported
+			}
+			f.deleteMu.Unlock()
+		}
+	}
+}
+
+func (f *Fs) asyncDeleteError(ctx context.Context) error {
+	f.deleteMu.Lock()
+	defer f.deleteMu.Unlock()
+	if f.deleteCause != nil && !accounting.Stats(ctx).HadFatalError() {
+		// High-level attempts can reset accounting while this queue retains failures.
+		f.deleteError = fs.CountError(ctx, f.deleteCause)
+	}
+	return f.deleteError
+}
+
+func (f *Fs) flushDeletions(ctx context.Context) error {
+	if !f.opt.AsyncDelete {
+		return nil
+	}
+	f.deleteMu.Lock()
+	pending := f.deletePending
+	f.deleteMu.Unlock()
+	if pending == 0 {
+		return f.asyncDeleteError(ctx)
+	}
+	done := make(chan error, 1)
+	_, err := f.deletions.Commit(ctx, "pending deletions", deleteItem{ctx: ctx, done: done})
+	if err != nil {
+		return err
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (f *Fs) deleteMediaBatch(ctx context.Context, items []deleteItem, indexes []int, results []error) {
@@ -3872,12 +4017,59 @@ func (f *Fs) deleteMediaBatch(ctx context.Context, items []deleteItem, indexes [
 		return
 	}
 	typ := items[active[0]].info.Type
+	var anchor int64
+	if c := f.metadata; c != nil {
+		c.mu.Lock()
+		if c.state != nil {
+			anchor = c.state.Anchor
+		}
+		c.mu.Unlock()
+	}
 	_, err := f.request(ctx, http.MethodPost, "/media/"+typ, "delete", url.Values{"softdelete": {"true"}}, map[string]any{typ + "s": ids})
 	if err != nil {
 		// Failed batches can leave some members deleted without confirming them.
 		f.expireMetadata()
 	}
 	var apiErr *api.Error
+	mediaError := errors.As(err, &apiErr)
+	uncertain := !mediaError && (fserrors.IsRetryError(err) || fserrors.ShouldRetry(err))
+	if mediaError {
+		// Unknown exceptions and already-trashed batches do not identify completed IDs.
+		uncertain = apiErr.Code == "MED-1000" || apiErr.Code == "MED-1022" && len(ids) > 1
+	}
+	if anchor > 0 && err != nil && uncertain {
+		changes, _, checkErr := f.changes(ctx, anchor)
+		if checkErr == nil {
+			confirmed := map[api.ID]bool{}
+			for _, id := range changes[typ].Deleted {
+				confirmed[id] = true
+			}
+			for source, change := range changes {
+				if source == "folder" {
+					continue
+				}
+				for _, id := range slices.Concat(change.New, change.Updated, change.Locked) {
+					delete(confirmed, id)
+				}
+			}
+			remaining := active[:0]
+			for _, i := range active {
+				id := items[i].info.ID
+				if confirmed[id] {
+					results[i] = nil
+					f.cacheMedia(items[i].info, true)
+				} else {
+					remaining = append(remaining, i)
+				}
+			}
+			active = remaining
+			if len(active) == 0 {
+				return
+			}
+		} else {
+			fs.Debugf(f, "Could not confirm batch deletions using changes: %v", checkErr)
+		}
+	}
 	if errors.As(err, &apiErr) && apiErr.Code == "MED-1022" {
 		if len(ids) == 1 {
 			// Already-trashed status confirms deletion only for a single ID.

@@ -14,12 +14,18 @@ import (
 
 	"github.com/rclone/rclone/backend/onemediahub/api"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func deleteTestFs(t *testing.T, checkers int, handler http.HandlerFunc, overrides ...configmap.Simple) *Fs {
+	f, _ := newDeleteTestFs(t, checkers, handler, overrides...)
+	return f
+}
+
+func newDeleteTestFs(t *testing.T, checkers int, handler http.HandlerFunc, overrides ...configmap.Simple) (*Fs, *fixture) {
 	t.Helper()
 	fx := newFixture(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -39,11 +45,19 @@ func deleteTestFs(t *testing.T, checkers int, handler http.HandlerFunc, override
 			m[key] = value
 		}
 	}
+	if m["async_delete"] == "true" {
+		ctx = accounting.WithStatsGroup(ctx, t.Name())
+	}
 	r, err := NewFs(ctx, "delete-test", "", m)
 	require.NoError(t, err)
 	f := r.(*Fs)
-	t.Cleanup(func() { require.NoError(t, f.Shutdown(context.Background())) })
-	return f
+	t.Cleanup(func() {
+		err := f.Shutdown(ctx)
+		if m["async_delete"] != "true" {
+			require.NoError(t, err)
+		}
+	})
+	return f, fx
 }
 
 func deleteTestIDs(t *testing.T, r *http.Request) []api.ID {
