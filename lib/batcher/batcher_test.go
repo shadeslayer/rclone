@@ -362,3 +362,93 @@ func TestBatcherCommitAsync(t *testing.T) {
 	assert.Equal(t, int32(4), commits.Load())
 	assert.Equal(t, int32(10), totalSize.Load())
 }
+
+func TestBatcherCancelledAdmission(t *testing.T) {
+	for _, mode := range []string{"sync", "async"} {
+		t.Run(mode, func(t *testing.T) {
+			var commits atomic.Int32
+			b, err := New[Item, Result](context.Background(), nil, func(_ context.Context, _ []Item, _ []Result, _ []error) error {
+				commits.Add(1)
+				return nil
+			}, Options{Mode: mode, Size: 1, MaxBatchSize: 1, Timeout: time.Millisecond})
+			require.NoError(t, err)
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			_, err = b.Commit(ctx, "cancelled", Item("cancelled"))
+			assert.ErrorIs(t, err, context.Canceled)
+			b.Shutdown()
+			assert.Zero(t, commits.Load())
+		})
+	}
+}
+
+func TestBatcherCancelledFullQueue(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	defer unblock()
+	var mu sync.Mutex
+	var committed []Item
+	b, err := New[Item, Result](context.Background(), nil, func(_ context.Context, items []Item, _ []Result, _ []error) error {
+		if items[0] == "first" {
+			close(started)
+			<-release
+		}
+		mu.Lock()
+		committed = append(committed, items...)
+		mu.Unlock()
+		return nil
+	}, Options{Mode: "async", Size: 1, MaxBatchSize: 1, Timeout: time.Hour})
+	require.NoError(t, err)
+	t.Cleanup(b.Shutdown)
+	_, err = b.Commit(context.Background(), "first", Item("first"))
+	require.NoError(t, err)
+	<-started
+	_, err = b.Commit(context.Background(), "second", Item("second"))
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := b.Commit(ctx, "cancelled", Item("cancelled")); done <- err }()
+	select {
+	case err := <-done:
+		assert.ErrorIs(t, err, context.DeadlineExceeded)
+	case <-time.After(time.Second):
+		t.Fatal("cancelled admission remained blocked by the full queue")
+	}
+	unblock()
+	b.Shutdown()
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []Item{"first", "second"}, committed)
+}
+
+func TestBatcherCancelledWaitingForAdmission(t *testing.T) {
+	ctx := context.Background()
+	ci := fs.GetConfig(ctx)
+	oldLevel := ci.LogLevel
+	ci.LogLevel = fs.LogLevelDebug
+	defer func() { ci.LogLevel = oldLevel }()
+	blocker := &blockingStringer{started: make(chan struct{}), release: make(chan struct{})}
+	unblock := sync.OnceFunc(func() { close(blocker.release) })
+	defer unblock()
+	b, err := New[Item, Result](ctx, blocker, func(_ context.Context, _ []Item, _ []Result, _ []error) error { return nil },
+		Options{Mode: "async", Size: 1, MaxBatchSize: 1, Timeout: time.Hour})
+	require.NoError(t, err)
+	t.Cleanup(b.Shutdown)
+	firstDone := make(chan error, 1)
+	go func() { _, err := b.Commit(ctx, "first", Item("first")); firstDone <- err }()
+	<-blocker.started
+	limited, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := b.Commit(limited, "cancelled", Item("cancelled")); done <- err }()
+	select {
+	case err := <-done:
+		assert.ErrorIs(t, err, context.DeadlineExceeded)
+	case <-time.After(time.Second):
+		t.Fatal("cancelled caller remained blocked waiting for admission")
+	}
+	unblock()
+	require.NoError(t, <-firstDone)
+	b.Shutdown()
+}

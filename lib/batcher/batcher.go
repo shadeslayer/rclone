@@ -47,7 +47,7 @@ type Batcher[Item, Result any] struct {
 	in       chan request[Item, Result]  // incoming items to batch
 	closed   chan struct{}               // close to indicate batcher shut down
 	atexit   atexit.FnHandle             // atexit handle
-	admitMu  sync.Mutex                  // serializes Commit admission with shutdown
+	admit    chan struct{}               // serializes Commit admission with shutdown
 	shutOnce sync.Once                   // make sure we shutdown once only
 	wg       sync.WaitGroup              // wait for shutdown
 }
@@ -106,6 +106,7 @@ func New[Item, Result any](ctx context.Context, f any, commit CommitBatchFn[Item
 		async:  async,
 		in:     make(chan request[Item, Result], opt.Size),
 		closed: make(chan struct{}),
+		admit:  make(chan struct{}, 1),
 	}
 	if b.Batching() {
 		b.atexit = atexit.Register(b.Shutdown)
@@ -240,7 +241,7 @@ func (b *Batcher[Item, Result]) Shutdown() {
 	b.shutOnce.Do(func() {
 		atexit.Unregister(b.atexit)
 		fs.Infof(b.f, "Committing uploads - please wait...")
-		b.admitMu.Lock()
+		b.admit <- struct{}{}
 		// show that batcher is shutting down
 		close(b.closed)
 		// quit the commitLoop by sending a quitRequest message
@@ -249,7 +250,7 @@ func (b *Batcher[Item, Result]) Shutdown() {
 		// cause write to closed channel in Commit when we are
 		// exiting due to a signal.
 		b.in <- request[Item, Result]{quit: true}
-		b.admitMu.Unlock()
+		<-b.admit
 		b.wg.Wait()
 	})
 }
@@ -263,22 +264,37 @@ func (b *Batcher[Item, Result]) Shutdown() {
 //
 // This should not be called if batching is off - check first with
 // IsBatching.
+// ctx cancels waiting to add an item; an admitted synchronous item still
+// waits for the commit callback to finish.
 func (b *Batcher[Item, Result]) Commit(ctx context.Context, name string, item Item) (entry Result, err error) {
-	b.admitMu.Lock()
+	if err := ctx.Err(); err != nil {
+		return entry, err
+	}
+	select {
+	case b.admit <- struct{}{}:
+	case <-ctx.Done():
+		return entry, ctx.Err()
+	}
 	select {
 	case <-b.closed:
-		b.admitMu.Unlock()
+		<-b.admit
 		return entry, fserrors.FatalError(errors.New("batcher is shutting down"))
 	default:
 	}
 	fs.Debugf(b.f, "Adding %q to batch", name)
 	resp := make(chan response[Result], 1)
-	b.in <- request[Item, Result]{
+	request := request[Item, Result]{
 		item:   item,
 		name:   name,
 		result: resp,
 	}
-	b.admitMu.Unlock()
+	select {
+	case b.in <- request:
+	case <-ctx.Done():
+		<-b.admit
+		return entry, ctx.Err()
+	}
+	<-b.admit
 	// If running async then don't wait for the result
 	if b.async {
 		return entry, nil
