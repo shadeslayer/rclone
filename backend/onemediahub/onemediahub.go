@@ -176,7 +176,7 @@ func init() {
 			},
 			{
 				Name:     "delete_batch_size",
-				Help:     "Maximum number of file deletions to batch, from 1 to 1000. Files are grouped by media type. Synchronous batches are limited by --checkers; asynchronous batches use this size directly. Smaller batches flush after 20 ms of inactivity. Set to 1 to send individual requests.",
+				Help:     "Maximum number of file deletions to batch, from 1 to 1000. Files are grouped by media type. Batches are reduced automatically when the server reports a lower limit. Synchronous batches are limited by --checkers; asynchronous batches use this size directly. Smaller batches flush after 20 ms of inactivity. Set to 1 to send individual requests.",
 				Default:  deleteBatchLimit,
 				Advanced: true,
 			},
@@ -383,6 +383,7 @@ type Fs struct {
 	metadataCancel     context.CancelFunc
 	deletions          *batcher.Batcher[deleteItem, error]
 	deleteMu           sync.Mutex
+	deleteLimits       map[string]int
 	deletePending      int
 	deleteCause        error
 	deleteError        error
@@ -3229,13 +3230,13 @@ type metadataItem struct {
 	id  api.ID
 }
 
-func uploadBatchContext(ctx context.Context, contexts []context.Context) (context.Context, context.CancelFunc) {
+func batchContext(ctx context.Context, contexts []context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithTimeout(ctx, metadataTimeout)
-	ctx, stop := uploadBatchCancellation(ctx, contexts)
+	ctx, stop := batchCancellation(ctx, contexts)
 	return ctx, func() { stop(); cancel() }
 }
 
-func uploadBatchCancellation(ctx context.Context, contexts []context.Context) (context.Context, context.CancelFunc) {
+func batchCancellation(ctx context.Context, contexts []context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(ctx)
 	var active atomic.Int32
 	active.Store(int32(len(contexts)))
@@ -3269,7 +3270,7 @@ func (f *Fs) checkUploadMetadata(ctx context.Context, items []metadataItem, resu
 	if len(ids) == 0 {
 		return nil
 	}
-	ctx, cancel := uploadBatchContext(ctx, contexts)
+	ctx, cancel := batchContext(ctx, contexts)
 	defer cancel()
 	metadata := make(map[api.ID]api.Media, len(ids))
 	err := f.fetchMedia(ctx, ids, false, func(item api.Media) error {
@@ -4535,7 +4536,7 @@ func (f *Fs) pollValidation(ctx context.Context, waiters []*validationWaiter, up
 		for _, waiter := range byID[id] {
 			itemContexts = append(itemContexts, waiter.ctx)
 		}
-		itemCtx, cancelItem := uploadBatchCancellation(ctx, itemContexts)
+		itemCtx, cancelItem := batchCancellation(ctx, itemContexts)
 		go func() {
 			defer cancelItem()
 			status, err := f.validation.Commit(itemCtx, string(id), validationItem{ctx: itemCtx, id: id, folderID: folder})
@@ -4758,21 +4759,7 @@ func (f *Fs) commitDeleteItems(items []deleteItem, results []error) {
 	}
 	for _, typ := range slices.Sorted(maps.Keys(groups)) {
 		indexes := groups[typ]
-		func() {
-			ctx, cancel := context.WithTimeout(context.WithoutCancel(items[indexes[0]].ctx), metadataTimeout)
-			defer cancel()
-			var active atomic.Int32
-			active.Store(int32(len(indexes)))
-			for _, i := range indexes {
-				stop := context.AfterFunc(items[i].ctx, func() {
-					if active.Add(-1) == 0 {
-						cancel()
-					}
-				})
-				defer stop()
-			}
-			f.deleteMediaBatch(ctx, items, indexes, results)
-		}()
+		f.deleteMediaBatch(context.WithoutCancel(items[indexes[0]].ctx), items, indexes, results)
 	}
 	if f.opt.AsyncDelete {
 		for i, result := range results {
@@ -4827,23 +4814,40 @@ func (f *Fs) flushDeletions(ctx context.Context) error {
 
 func (f *Fs) deleteMediaBatch(ctx context.Context, items []deleteItem, indexes []int, results []error) {
 	var ids []api.ID
-	seen := map[api.ID]bool{}
+	seen := map[api.ID]int{}
+	var contexts []context.Context
 	active := make([]int, 0, len(indexes))
 	for _, i := range indexes {
 		if results[i] = items[i].ctx.Err(); results[i] != nil {
 			continue
 		}
 		active = append(active, i)
+		contexts = append(contexts, items[i].ctx)
 		id := items[i].info.ID
-		if !seen[id] {
+		if _, found := seen[id]; !found {
+			seen[id] = len(ids)
 			ids = append(ids, id)
-			seen[id] = true
 		}
 	}
 	if len(active) == 0 {
 		return
 	}
 	typ := items[active[0]].info.Type
+	f.deleteMu.Lock()
+	limit := f.deleteLimits[typ]
+	f.deleteMu.Unlock()
+	if limit > 0 && len(ids) > limit {
+		// Keep duplicate callers together so each ID is sent in only one chunk.
+		chunks := make([][]int, (len(ids)+limit-1)/limit)
+		for _, i := range active {
+			chunk := seen[items[i].info.ID] / limit
+			chunks[chunk] = append(chunks[chunk], i)
+		}
+		for _, chunk := range chunks {
+			f.deleteMediaBatch(ctx, items, chunk, results)
+		}
+		return
+	}
 	var anchor int64
 	if c := f.metadata; c != nil {
 		c.mu.Lock()
@@ -4852,20 +4856,40 @@ func (f *Fs) deleteMediaBatch(ctx context.Context, items []deleteItem, indexes [
 		}
 		c.mu.Unlock()
 	}
-	_, err := f.request(ctx, http.MethodPost, "/media/"+typ, "delete", url.Values{"softdelete": {"true"}}, map[string]any{typ + "s": ids})
+	// Each chunk has its own deadline and only its active callers can cancel it.
+	requestCtx, cancel := batchContext(ctx, contexts)
+	_, err := f.request(requestCtx, http.MethodPost, "/media/"+typ, "delete", url.Values{"softdelete": {"true"}}, map[string]any{typ + "s": ids})
+	cancel()
 	if err != nil {
 		// Failed batches can leave some members deleted without confirming them.
 		f.expireMetadata()
 	}
 	var apiErr *api.Error
 	mediaError := errors.As(err, &apiErr)
+	if mediaError && apiErr.Code == "MED-1025" && len(ids) > 1 {
+		f.deleteMu.Lock()
+		if f.deleteLimits == nil {
+			f.deleteLimits = make(map[string]int)
+		}
+		limit = len(ids) / 2
+		if previous := f.deleteLimits[typ]; previous > 0 {
+			limit = min(limit, previous)
+		}
+		f.deleteLimits[typ] = limit
+		f.deleteMu.Unlock()
+		fs.Debugf(f, "Reducing %s deletion batches to %d items after MED-1025", typ, limit)
+		f.deleteMediaBatch(ctx, items, active, results)
+		return
+	}
 	uncertain := !mediaError && (fserrors.IsRetryError(err) || fserrors.ShouldRetry(err))
 	if mediaError {
 		// Unknown exceptions and already-trashed batches do not identify completed IDs.
 		uncertain = apiErr.Code == "MED-1000" || apiErr.Code == "MED-1022" && len(ids) > 1
 	}
 	if anchor > 0 && err != nil && uncertain {
-		changes, _, checkErr := f.changes(ctx, anchor)
+		checkCtx, cancel := batchContext(ctx, contexts)
+		changes, _, checkErr := f.changes(checkCtx, anchor)
+		cancel()
 		if checkErr == nil {
 			confirmed := map[api.ID]bool{}
 			for _, id := range changes[typ].Deleted {

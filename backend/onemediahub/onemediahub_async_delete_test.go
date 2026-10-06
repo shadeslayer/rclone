@@ -93,6 +93,31 @@ func TestAsyncDeleteQueueAndDrain(t *testing.T) {
 	assert.Error(t, objects[0].Remove(ctx))
 }
 
+func TestAsyncDeleteServerLimit(t *testing.T) {
+	ctx := asyncDeleteContext(t)
+	var mu sync.Mutex
+	var accepted []api.ID
+	f := deleteTestFs(t, 1, func(w http.ResponseWriter, r *http.Request) {
+		ids := deleteTestIDs(t, r)
+		if len(ids) > 2 {
+			jsonReply(t, w, map[string]any{"error": &api.Error{Code: "MED-1025", Message: "over the limit"}})
+			return
+		}
+		mu.Lock()
+		accepted = append(accepted, ids...)
+		mu.Unlock()
+	}, configmap.Simple{"async_delete": "true", "delete_batch_size": "4"})
+	for i := range 8 {
+		require.NoError(t, (&Object{fs: f, info: api.Media{ID: api.ID(fmt.Sprint(i + 1)), Type: "file"}}).Remove(ctx))
+	}
+	require.NoError(t, f.Shutdown(ctx))
+	assert.Zero(t, accounting.Stats(ctx).GetErrors())
+	assert.False(t, accounting.Stats(ctx).HadFatalError())
+	mu.Lock()
+	defer mu.Unlock()
+	assert.ElementsMatch(t, []api.ID{"1", "2", "3", "4", "5", "6", "7", "8"}, accepted)
+}
+
 func TestAsyncDeleteFailureAccounting(t *testing.T) {
 	ctx := asyncDeleteContext(t)
 	f := deleteTestFs(t, 1, func(w http.ResponseWriter, r *http.Request) {
@@ -302,10 +327,12 @@ func TestAsyncDeleteCLI(t *testing.T) {
 		status  int
 		noCache bool
 		sync    bool
+		limit   int
 	}{
-		{"delete", 0, false, false}, {"sync", 0, false, true},
-		{"forbidden", http.StatusForbidden, false, false},
-		{"late failure without fs cache", http.StatusForbidden, true, false},
+		{"delete", 0, false, false, 0}, {"sync", 0, false, true, 0},
+		{"delete with server limit", 0, false, false, 1}, {"sync with server limit", 0, false, true, 1},
+		{"forbidden", http.StatusForbidden, false, false, 0},
+		{"late failure without fs cache", http.StatusForbidden, true, false, 0},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fx := newFixture(t)
@@ -327,6 +354,10 @@ func TestAsyncDeleteCLI(t *testing.T) {
 					mu.Unlock()
 					if test.status != 0 {
 						w.WriteHeader(test.status)
+						return
+					}
+					if test.limit > 0 && len(ids) > test.limit {
+						jsonReply(t, w, map[string]any{"error": &api.Error{Code: "MED-1025", Message: "over the limit"}})
 						return
 					}
 					r.Body = io.NopCloser(bytes.NewReader(body))
@@ -360,7 +391,11 @@ func TestAsyncDeleteCLI(t *testing.T) {
 				assert.Contains(t, string(output), "asynchronous deletion")
 			}
 			mu.Lock()
-			assert.Equal(t, []int{3}, sizes)
+			if test.limit > 0 {
+				assert.Equal(t, []int{3, 1, 1, 1}, sizes)
+			} else {
+				assert.Equal(t, []int{3}, sizes)
+			}
 			mu.Unlock()
 			fx.mu.Lock()
 			if test.status == 0 {

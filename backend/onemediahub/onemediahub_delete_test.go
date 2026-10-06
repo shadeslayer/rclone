@@ -409,6 +409,159 @@ func TestDeleteBatchPartialFailures(t *testing.T) {
 	assert.True(t, f.metadata.checked.IsZero())
 }
 
+func TestDeleteBatchServerLimit(t *testing.T) {
+	for _, limit := range []int{1, 3} {
+		t.Run(fmt.Sprint(limit), func(t *testing.T) {
+			var mu sync.Mutex
+			var sizes []int
+			accepted := map[api.ID]int{}
+			f := deleteTestFs(t, 10, func(w http.ResponseWriter, r *http.Request) {
+				ids := deleteTestIDs(t, r)
+				mu.Lock()
+				defer mu.Unlock()
+				sizes = append(sizes, len(ids))
+				if r.URL.Path == "/sapi/media/file" && len(ids) > limit {
+					jsonReply(t, w, map[string]any{"error": &api.Error{Code: "MED-1025", Message: "Number of items in the request is over the limit"}})
+					return
+				}
+				for _, id := range ids {
+					accepted[id]++
+				}
+			})
+			for round := range 2 {
+				for _, typ := range []string{"file", "picture"} {
+					var items []deleteItem
+					for _, id := range []int{1, 2, 3, 1, 4, 5, 6, 7, 2} {
+						items = append(items, deleteItem{ctx: context.Background(), info: api.Media{ID: api.ID(fmt.Sprint(id + 10*round)), Type: typ}})
+					}
+					results := make([]error, len(items))
+					f.commitDeleteItems(items, results)
+					for _, err := range results {
+						require.NoError(t, err)
+					}
+					mu.Lock()
+					assert.Len(t, accepted, 7)
+					for _, count := range accepted {
+						assert.Equal(t, 1, count, "duplicate waiters must share one deletion")
+					}
+					if typ == "picture" {
+						assert.Equal(t, []int{7}, sizes, "limits are independent for each media type")
+					} else if round == 1 {
+						for _, size := range sizes {
+							assert.LessOrEqual(t, size, limit, "later batches must reuse the reduced size")
+						}
+					} else {
+						assert.Equal(t, 7, sizes[0])
+					}
+					sizes, accepted = nil, map[api.ID]int{}
+					mu.Unlock()
+				}
+			}
+		})
+	}
+}
+
+func TestDeleteBatchServerLimitPartialFailures(t *testing.T) {
+	var requests atomic.Int32
+	f := deleteTestFs(t, 4, func(w http.ResponseWriter, r *http.Request) {
+		ids := deleteTestIDs(t, r)
+		requests.Add(1)
+		code := ""
+		switch {
+		case len(ids) > 1, ids[0] == "4":
+			code = "MED-1025"
+		case ids[0] == "2":
+			code = "MED-1034"
+		case ids[0] == "3":
+			code = "MED-1022"
+		}
+		if code != "" {
+			jsonReply(t, w, map[string]any{"error": &api.Error{Code: code, Message: "delete rejected"}})
+		}
+	})
+	f.metadata = &metadataCache{state: &metadataSnapshot{Media: map[api.ID]api.Media{}}, byName: map[mediaKey]api.ID{}, checked: time.Now()}
+	var items []deleteItem
+	for i := range 4 {
+		info := api.Media{ID: api.ID(fmt.Sprint(i + 1)), Name: fmt.Sprint(i + 1), Type: "file"}
+		f.cacheMedia(info, false)
+		items = append(items, deleteItem{ctx: context.Background(), info: info})
+	}
+	results := make([]error, len(items))
+	f.commitDeleteItems(items, results)
+	assert.NoError(t, results[0])
+	assert.ErrorContains(t, results[1], "MED-1034")
+	assert.NoError(t, results[2])
+	assert.ErrorContains(t, results[3], "MED-1025", "a rejected single ID must remain an error")
+	assert.LessOrEqual(t, requests.Load(), int32(7), "splitting must terminate")
+	f.metadata.mu.Lock()
+	defer f.metadata.mu.Unlock()
+	assert.Len(t, f.metadata.state.Media, 2)
+	assert.Contains(t, f.metadata.state.Media, api.ID("2"))
+	assert.Contains(t, f.metadata.state.Media, api.ID("4"))
+	assert.True(t, f.metadata.checked.IsZero())
+}
+
+func TestDeleteBatchServerLimitCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started, canceled := make(chan struct{}, 1), make(chan struct{}, 1)
+	f := deleteTestFs(t, 6, func(w http.ResponseWriter, r *http.Request) {
+		ids := deleteTestIDs(t, r)
+		if len(ids) > 1 {
+			jsonReply(t, w, map[string]any{"error": &api.Error{Code: "MED-1025", Message: "over the limit"}})
+			return
+		}
+		if slices.Contains(ids, api.ID("3")) {
+			started <- struct{}{}
+			select {
+			case <-r.Context().Done():
+				canceled <- struct{}{}
+			case <-time.After(3 * time.Second):
+				t.Error("a split request retained callers from completed chunks")
+			}
+		}
+	})
+	var items []deleteItem
+	for i := range 6 {
+		itemCtx := context.Background()
+		if i == 2 {
+			itemCtx = ctx
+		}
+		items = append(items, deleteItem{ctx: itemCtx, info: api.Media{ID: api.ID(fmt.Sprint(i + 1)), Type: "file"}})
+	}
+	results := make([]error, len(items))
+	done := make(chan struct{})
+	go func() {
+		f.commitDeleteItems(items, results)
+		close(done)
+	}()
+	select {
+	case <-started:
+		cancel()
+	case <-done:
+		t.Fatal("batch failed before splitting")
+	case <-time.After(5 * time.Second):
+		t.Fatal("split request did not start")
+	}
+	select {
+	case <-canceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("split request did not cancel")
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("remaining requests did not finish")
+	}
+	for i, err := range results {
+		if i == 2 {
+			assert.ErrorIs(t, err, context.Canceled)
+		} else {
+			assert.NoError(t, err)
+		}
+	}
+}
+
 func TestDeleteBatchDoesNotSplitGlobalErrors(t *testing.T) {
 	for _, code := range []string{"SEC-1001", "MED-1000", "MED-1007", "MED-1034", "MED-9999"} {
 		t.Run(code, func(t *testing.T) {
