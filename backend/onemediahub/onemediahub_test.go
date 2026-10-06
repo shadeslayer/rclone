@@ -193,6 +193,46 @@ func TestMetadataCache(t *testing.T) {
 	assert.ErrorIs(t, f.Rmdir(ctx, "external"), fs.ErrorDirectoryNotEmpty)
 }
 
+func TestMetadataCacheSoftDeletedChanges(t *testing.T) {
+	cacheDir := config.GetCacheDir()
+	require.NoError(t, config.SetCacheDir(t.TempDir()))
+	t.Cleanup(func() { require.NoError(t, config.SetCacheDir(cacheDir)) })
+	ctx := context.Background()
+	fx := newFixture(t)
+	fx.requestTime = 1700000000000
+	fx.folders = []api.Folder{{ID: "1", Name: "parent"}, {ID: "2", ParentID: "1", Name: "child"}}
+	fx.media = []api.Media{{ID: "3", FolderID: "2", Name: "trashed"}, {ID: "4", Name: "deleted"}, {ID: "5", Name: "kept"}}
+	fx.changes = map[string]api.Changes{"folder": {Locked: []api.ID{"1", "2"}}, "file": {New: []api.ID{"3", "4", "5"}, Locked: []api.ID{"3", "4"}}}
+	m := fx.config(t)
+	m["metadata_cache"] = "true"
+	remote, err := NewFs(ctx, "soft-deleted", "", m)
+	require.NoError(t, err)
+	f := remote.(*Fs)
+	t.Cleanup(func() { require.NoError(t, f.Shutdown(ctx)) })
+	_, err = f.NewObject(ctx, "parent/child/trashed")
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []api.ID{"3", "4"}, f.metadata.state.Pending)
+	assert.ElementsMatch(t, []api.ID{"1", "2"}, f.metadata.state.PendingFolders)
+	fx.mu.Lock()
+	fx.requestTime += 60000
+	fx.changeData = map[string]any{
+		"folder": map[string]any{"S": []api.ID{"1", "2"}, "D": []api.ID{"1"}},
+		"file":   map[string]any{"S": []api.ID{"3"}, "D": []api.ID{"3", "4"}},
+	}
+	fx.mu.Unlock()
+	f.expireMetadata()
+	entries, err := f.List(ctx, "")
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "kept", entries[0].Remote())
+	_, err = f.NewObject(ctx, "parent/child/trashed")
+	assert.ErrorIs(t, err, fs.ErrorObjectNotFound)
+	assert.Empty(t, f.metadata.state.Folders)
+	assert.Empty(t, f.metadata.state.Pending)
+	assert.Empty(t, f.metadata.state.PendingFolders)
+	assert.Equal(t, fx.requestTime, f.metadata.state.Anchor)
+}
+
 func TestDirMove(t *testing.T) {
 	for _, cached := range []bool{false, true} {
 		t.Run(strconv.FormatBool(cached), func(t *testing.T) {

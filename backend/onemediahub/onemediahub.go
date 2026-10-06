@@ -771,11 +771,11 @@ func (f *Fs) changes(ctx context.Context, anchor int64) (map[string]api.Changes,
 			return nil, 0, fmt.Errorf("changes API returned unsupported source %q", source)
 		}
 		for status := range statuses {
-			if !slices.Contains([]string{"N", "U", "D", "L"}, status) {
+			if !slices.Contains([]string{"N", "U", "D", "S", "L"}, status) {
 				return nil, 0, fmt.Errorf("changes API returned unsupported status %q", status)
 			}
 		}
-		changes[source] = api.Changes{New: statuses["N"], Updated: statuses["U"], Deleted: statuses["D"], Locked: statuses["L"]}
+		changes[source] = api.Changes{New: statuses["N"], Updated: statuses["U"], Deleted: slices.Concat(statuses["D"], statuses["S"]), Locked: statuses["L"]}
 	}
 	return changes, timestamp, nil
 }
