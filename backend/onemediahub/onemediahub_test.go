@@ -233,6 +233,93 @@ func TestMetadataCacheSoftDeletedChanges(t *testing.T) {
 	assert.Equal(t, fx.requestTime, f.metadata.state.Anchor)
 }
 
+func TestListR(t *testing.T) {
+	for _, cached := range []bool{false, true} {
+		for _, mode := range []string{"directory", "path-root", "id-root"} {
+			t.Run(fmt.Sprintf("cached=%v/%s", cached, mode), func(t *testing.T) {
+				cacheDir := config.GetCacheDir()
+				require.NoError(t, config.SetCacheDir(t.TempDir()))
+				t.Cleanup(func() { require.NoError(t, config.SetCacheDir(cacheDir)) })
+				ctx := context.Background()
+				fx := newFixture(t)
+				fx.requestTime = 1700000000000
+				fx.folders = []api.Folder{{ID: "1", Name: "base"}, {ID: "2", ParentID: "1", Name: "child"}, {ID: "3", ParentID: "2", Name: "empty"}, {ID: "4", Name: "outside"}, {ID: "5", ParentID: "999", Name: "orphan"}, {ID: "6", ParentID: "1", Name: "trash", SoftDeleted: true}}
+				fx.media = []api.Media{{ID: "10", FolderID: "0", Name: "unfiled"}, {ID: "11", FolderID: "1", Name: "file"}, {ID: "12", FolderID: "2", Name: "duplicate"}, {ID: "13", FolderID: "4", Name: "outside"}, {ID: "14", FolderID: "6", Name: "hidden"}, {ID: "15", FolderID: "2", Name: "duplicate"}}
+				fx.changes = map[string]api.Changes{"file": {New: []api.ID{"10", "11", "12", "13", "14", "15"}}}
+				m := fx.config(t)
+				m["metadata_cache"] = strconv.FormatBool(cached)
+				root, dir, prefix := "", "base", "base/"
+				if mode == "path-root" {
+					root, dir, prefix = "base", "", ""
+				} else if mode == "id-root" {
+					m["root_folder_id"] = "1"
+					dir, prefix = "", ""
+				}
+				remote, err := NewFs(ctx, "list-r", root, m)
+				require.NoError(t, err)
+				f := remote.(*Fs)
+				t.Cleanup(func() { require.NoError(t, f.Shutdown(ctx)) })
+				require.NotNil(t, f.Features().ListR)
+				before := fx.requests["/sapi/media"]
+				var got []string
+				err = f.Features().ListR(ctx, dir, func(entries fs.DirEntries) error {
+					for _, entry := range entries {
+						got = append(got, entry.Remote()+"#"+entry.(fs.IDer).ID())
+					}
+					// A callback may call back into the backend.
+					_, err := f.NewObject(ctx, prefix+"file")
+					return err
+				})
+				require.NoError(t, err)
+				assert.ElementsMatch(t, []string{prefix + "child#2", prefix + "child/empty#3", prefix + "file#11", prefix + "child/duplicate#12", prefix + "child/duplicate#15"}, got)
+				if cached {
+					assert.Equal(t, before, fx.requests["/sapi/media"])
+				}
+				assert.ErrorIs(t, f.Features().ListR(ctx, "missing", func(fs.DirEntries) error { t.Fatal("unexpected callback"); return nil }), fs.ErrorDirNotFound)
+			})
+		}
+	}
+}
+
+func TestListRCallbackAndCancellation(t *testing.T) {
+	ctx := context.Background()
+	fx := newFixture(t)
+	for i := range 201 {
+		fx.media = append(fx.media, api.Media{ID: api.ID(strconv.Itoa(i + 1)), Name: strconv.Itoa(i)})
+	}
+	remote, err := NewFs(ctx, "list-r-errors", "", fx.config(t))
+	require.NoError(t, err)
+	f := remote.(*Fs)
+	t.Cleanup(func() { require.NoError(t, f.Shutdown(ctx)) })
+	require.NotNil(t, f.Features().ListR)
+	wantErr := fmt.Errorf("stop listing")
+	calls := 0
+	err = f.Features().ListR(ctx, "", func(entries fs.DirEntries) error {
+		calls++
+		assert.Len(t, entries, 100)
+		return wantErr
+	})
+	assert.ErrorIs(t, err, wantErr)
+	assert.Equal(t, 1, calls)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	err = f.Features().ListR(ctx, "", func(fs.DirEntries) error { cancel(); return nil })
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
+func TestListRCyclicFolders(t *testing.T) {
+	fx := newFixture(t)
+	fx.folders = []api.Folder{{ID: "1", ParentID: "1", Name: "cycle"}}
+	m := fx.config(t)
+	m["root_folder_id"] = "1"
+	remote, err := NewFs(context.Background(), "list-r-cycle", "", m)
+	require.NoError(t, err)
+	f := remote.(*Fs)
+	t.Cleanup(func() { require.NoError(t, f.Shutdown(context.Background())) })
+	err = f.ListR(context.Background(), "", func(fs.DirEntries) error { t.Fatal("unexpected callback"); return nil })
+	assert.ErrorContains(t, err, "repeats ID")
+}
+
 func TestDirMove(t *testing.T) {
 	for _, cached := range []bool{false, true} {
 		t.Run(strconv.FormatBool(cached), func(t *testing.T) {

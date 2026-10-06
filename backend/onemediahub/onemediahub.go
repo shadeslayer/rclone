@@ -33,6 +33,7 @@ import (
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/fs/list"
 	"github.com/rclone/rclone/lib/batcher"
 	"github.com/rclone/rclone/lib/cache"
 	"github.com/rclone/rclone/lib/dircache"
@@ -1165,6 +1166,112 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 	return entries, err
 }
 
+func (f *Fs) folderPaths(ctx context.Context, folders []api.Folder, parent api.ID, dir string) (map[api.ID]string, error) {
+	if parent == "0" {
+		parent = ""
+	}
+	children := make(map[api.ID][]api.Folder, len(folders))
+	for _, folder := range folders {
+		if folder.SoftDeleted || folder.Status == statusDeleted {
+			continue
+		}
+		id := folder.ParentID
+		if id == "0" {
+			id = ""
+		}
+		children[id] = append(children[id], folder)
+	}
+	paths := map[api.ID]string{parent: dir}
+	queue := []api.ID{parent}
+	for i := 0; i < len(queue); i++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		id := queue[i]
+		for _, folder := range children[id] {
+			if _, found := paths[folder.ID]; found {
+				return nil, fmt.Errorf("folder hierarchy repeats ID %s", folder.ID)
+			}
+			paths[folder.ID] = path.Join(paths[id], f.opt.Enc.ToStandardName(folder.Name))
+			queue = append(queue, folder.ID)
+		}
+	}
+	return paths, nil
+}
+
+// ListR lists files and directories recursively below dir.
+func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := f.syncMetadata(ctx); err != nil {
+		return err
+	}
+	parent, err := f.dirCache.FindDir(ctx, dir, false)
+	if err != nil {
+		return err
+	}
+	var folders []api.Folder
+	var items []api.Media
+	if c := f.metadata; c != nil {
+		c.mu.Lock()
+		folders = slices.Clone(c.state.Folders)
+		items = slices.Collect(maps.Values(c.state.Media))
+		c.mu.Unlock()
+	} else {
+		folders, err = f.folders(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	if parent != "" && parent != "0" && !slices.ContainsFunc(folders, func(folder api.Folder) bool {
+		return string(folder.ID) == parent && !folder.SoftDeleted && folder.Status != statusDeleted
+	}) {
+		return fs.ErrorDirNotFound
+	}
+	paths, err := f.folderPaths(ctx, folders, api.ID(parent), dir)
+	if err != nil {
+		return err
+	}
+	helper := list.NewHelper(callback)
+	for _, folder := range folders {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		remote, found := paths[folder.ID]
+		if !found || string(folder.ID) == parent {
+			continue
+		}
+		f.dirCache.Put(remote, string(folder.ID))
+		if err := helper.Add(fs.NewDir(remote, time.UnixMilli(folder.Date)).SetID(string(folder.ID))); err != nil {
+			return err
+		}
+	}
+	visit := func(item api.Media) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		parent := item.FolderID
+		if parent == "0" {
+			parent = ""
+		}
+		if remote, found := paths[parent]; found && !item.SoftDeleted && item.Status != statusDeleted {
+			return helper.Add(&Object{fs: f, remote: path.Join(remote, f.opt.Enc.ToStandardName(item.Name)), info: item})
+		}
+		return nil
+	}
+	if f.metadata != nil {
+		for _, item := range items {
+			if err := visit(item); err != nil {
+				return err
+			}
+		}
+	} else if err := f.media(ctx, nil, visit); err != nil {
+		return err
+	}
+	return helper.Flush()
+}
+
 // NewObject finds a file by its path, returning ErrorObjectNotFound if absent.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	if err := f.syncMetadata(ctx); err != nil {
@@ -1971,5 +2078,6 @@ var (
 	_ fs.Abouter         = (*Fs)(nil)
 	_ fs.Shutdowner      = (*Fs)(nil)
 	_ fs.DirMover        = (*Fs)(nil)
+	_ fs.ListRer         = (*Fs)(nil)
 	_ dircache.DirCacher = (*Fs)(nil)
 )
