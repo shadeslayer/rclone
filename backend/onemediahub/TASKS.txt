@@ -17,8 +17,15 @@ Validation:
   - Live O2 numbered-marker creation and projection passed; owned test entries
     were deleted afterward. Existing account files were not changed.
 
-[ ] Complete the final backend cleanup and consistent trash filtering
+[x] Complete the final backend cleanup and consistent trash filtering
 
-Reuse existing rclone frameworks, preserve raw upload/source identities, and
-remove repeated provider-specific deletion checks without weakening validation.
-Review every commit adversarially before committing.
+Centralize provider deletion status handling for media and folders. Exclude
+trash consistently from cached listings, lookups, name indexes, path mappings
+and mount notifications; remove a redundant projection branch. Existing
+rclone request, directory-cache, listing, pacing, batching and persistence
+frameworks cover the remaining infrastructure. Preserve the specialized
+upload/source and journal validation required for crypt and restart safety.
+
+Validation covers legacy caches with an empty changes feed, active files
+shadowed by higher-ID trashed duplicates, and local cache writes of deleted
+media/folders. Both commits receive adversarial review before committing.

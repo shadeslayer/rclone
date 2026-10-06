@@ -58,7 +58,6 @@ const (
 	maxSleep             = 2 * time.Second
 	decayConstant        = 2
 	dateFormat           = "20060102T150405Z"
-	statusDeleted        = "D"
 	maxAuthAttempts      = 2
 	maxRedirects         = 10
 	deviceHeader         = "X-deviceid"
@@ -779,6 +778,7 @@ func (f *Fs) mediaKey(item api.Media) mediaKey {
 }
 
 func (f *Fs) cacheMedia(item api.Media, remove bool) {
+	remove = remove || item.IsDeleted()
 	if f.downloadURLs != nil {
 		f.downloadURLs.DeletePrefix(string(item.ID) + "/")
 	}
@@ -798,7 +798,7 @@ func (f *Fs) cacheMedia(item api.Media, remove bool) {
 			if c.byName[key] == item.ID {
 				delete(c.byName, key)
 				for id, other := range c.state.Media {
-					if id != item.ID && f.mediaKey(other) == key && id > c.byName[key] {
+					if id != item.ID && !other.IsDeleted() && f.mediaKey(other) == key && id > c.byName[key] {
 						c.byName[key] = id
 					}
 				}
@@ -817,6 +817,7 @@ func (f *Fs) cacheMedia(item api.Media, remove bool) {
 }
 
 func (f *Fs) cacheFolder(folder api.Folder, remove bool) {
+	remove = remove || folder.IsDeleted()
 	if c := f.metadata; c != nil {
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -1031,7 +1032,7 @@ func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
 			}
 			for _, folder := range folders {
 				next.Folders = slices.DeleteFunc(next.Folders, func(old api.Folder) bool { return old.ID == folder.ID })
-				if !folder.SoftDeleted && folder.Status != statusDeleted {
+				if !folder.IsDeleted() {
 					next.Folders = append(next.Folders, folder)
 				}
 				if folder.Status != "L" && !slices.Contains(folderChanges.Locked, folder.ID) {
@@ -1081,7 +1082,7 @@ func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
 	for batch := range slices.Chunk(ordered, pageSize) {
 		if err := f.fetchMedia(ctx, batch, true, func(item api.Media) error {
 			old, found := next.Media[item.ID]
-			if item.SoftDeleted || item.Status == statusDeleted || item.Status == "S" {
+			if item.IsDeleted() {
 				delete(next.Media, item.ID)
 				delete(ids, item.ID)
 				metadataChanged = metadataChanged || found
@@ -1131,7 +1132,9 @@ func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
 	if indexChanged {
 		c.byName = make(map[mediaKey]api.ID, len(next.Media))
 		for _, id := range slices.Sorted(maps.Keys(next.Media)) {
-			c.byName[f.mediaKey(next.Media[id])] = id
+			if item := next.Media[id]; !item.IsDeleted() {
+				c.byName[f.mediaKey(item)] = id
+			}
 		}
 	}
 	c.checked = time.Now()
@@ -1237,7 +1240,7 @@ func (f *Fs) FindLeaf(ctx context.Context, parent, leaf string) (string, bool, e
 	}
 	// Compare displayed names to resolve server-created names such as "/".
 	for _, folder := range folders {
-		if sameParent(folder.ParentID, parent) && f.opt.Enc.ToStandardName(folder.Name) == leaf && folder.Status != statusDeleted && !folder.SoftDeleted {
+		if sameParent(folder.ParentID, parent) && f.opt.Enc.ToStandardName(folder.Name) == leaf && !folder.IsDeleted() {
 			return string(folder.ID), true, nil
 		}
 	}
@@ -1269,6 +1272,9 @@ func (f *Fs) media(ctx context.Context, ids []api.ID, visit func(api.Media) erro
 		items := slices.Collect(maps.Values(c.state.Media))
 		c.mu.Unlock()
 		for _, item := range items {
+			if item.IsDeleted() {
+				continue
+			}
 			if err := visit(item); err != nil {
 				return err
 			}
@@ -1300,7 +1306,7 @@ func (f *Fs) fetchMedia(ctx context.Context, ids []api.ID, includeDeleted bool, 
 			return err
 		}
 		for _, item := range result.Media {
-			if !includeDeleted && (item.SoftDeleted || item.Status == statusDeleted || item.Status == "S") {
+			if !includeDeleted && item.IsDeleted() {
 				continue
 			}
 
@@ -1433,14 +1439,14 @@ func flatRecordMatches(record flatPathRecord, item api.Media) bool {
 }
 
 func (f *Fs) readFlatMapping(ctx context.Context, item api.Media, records map[api.ID]flatPathRecord) (string, error) {
+	if item.IsDeleted() || item.Size <= 0 || item.Size > flatMappingLimit {
+		return "", errors.New("invalid flat path mapping media")
+	}
 	name := f.opt.Enc.ToStandardName(item.Name)
 	if record, found := records[item.ID]; found && flatRecordMatches(record, item) {
 		if remote, err := flatPayloadPath(record.flatPathPayload, name); err == nil {
 			return remote, nil
 		}
-	}
-	if item.SoftDeleted || item.Status == statusDeleted || item.Size <= 0 || item.Size > flatMappingLimit {
-		return "", errors.New("invalid flat path mapping media")
 	}
 	o := &Object{fs: f, info: item}
 	body, err := o.Open(ctx)
@@ -1489,7 +1495,7 @@ func (f *Fs) flatMappings(ctx context.Context, items []api.Media) (map[mediaKey]
 	mappings := make(map[mediaKey][]api.Media)
 	references := make(map[mediaKey]bool)
 	for _, item := range items {
-		if !sameParent(item.FolderID, f.opt.RootFolderID) || item.SoftDeleted || item.Status == statusDeleted {
+		if !sameParent(item.FolderID, f.opt.RootFolderID) || item.IsDeleted() {
 			continue
 		}
 		key := f.mediaKey(item)
@@ -1546,7 +1552,7 @@ func (f *Fs) flatMappings(ctx context.Context, items []api.Media) (map[mediaKey]
 		}
 	}
 	for _, item := range items {
-		if sameParent(item.FolderID, f.opt.RootFolderID) && !item.SoftDeleted && item.Status != statusDeleted {
+		if sameParent(item.FolderID, f.opt.RootFolderID) && !item.IsDeleted() {
 			key := f.mediaKey(item)
 			if _, _, mapping, ok := parseFlatHashName(key.name); ok && !mapping {
 				if _, _, err := f.resolvedFlatName(key, paths); err != nil {
@@ -1573,7 +1579,7 @@ func (f *Fs) flatMappings(ctx context.Context, items []api.Media) (map[mediaKey]
 		c.flatReady = true
 		currentReferences := maps.Clone(references)
 		for _, item := range c.state.Media {
-			if !sameParent(item.FolderID, f.opt.RootFolderID) || item.SoftDeleted || item.Status == statusDeleted {
+			if !sameParent(item.FolderID, f.opt.RootFolderID) || item.IsDeleted() {
 				continue
 			}
 			if digest, _, mapping, ok := parseFlatHashName(f.mediaKey(item).name); ok && !mapping {
@@ -1587,7 +1593,7 @@ func (f *Fs) flatMappings(ctx context.Context, items []api.Media) (map[mediaKey]
 		counts := make(map[mediaKey]int)
 		for _, item := range c.state.Media {
 			key := f.mediaKey(item)
-			if !currentReferences[key] || item.SoftDeleted || item.Status == statusDeleted {
+			if !currentReferences[key] || item.IsDeleted() {
 				continue
 			}
 			counts[key]++
@@ -1632,7 +1638,7 @@ func (f *Fs) rebuildFlatIndex(c *metadataCache) {
 	c.flatPaths = make(map[mediaKey]string)
 	for id, record := range c.state.FlatPaths {
 		item, found := c.state.Media[id]
-		if !found || item.SoftDeleted || item.Status == statusDeleted || !flatRecordMatches(record, item) {
+		if !found || item.IsDeleted() || !flatRecordMatches(record, item) {
 			delete(c.state.FlatPaths, id)
 			c.dirty = true
 			continue
@@ -1711,7 +1717,7 @@ func (f *Fs) ensureFlatMapping(ctx context.Context, full string) error {
 		key := mediaKey{parent: parent, name: name}
 		if c.flatNames[key] > 1 {
 			for _, item := range c.state.Media {
-				if f.mediaKey(item) == key && !item.SoftDeleted && item.Status != statusDeleted {
+				if f.mediaKey(item) == key && !item.IsDeleted() {
 					items = append(items, item)
 				}
 			}
@@ -1832,7 +1838,7 @@ func (f *Fs) flatPath(remote string) (string, error) {
 // indexFlatMedia maintains directory reference counts alongside the raw name index.
 // The metadata lock must be held, and delta is 1 for addition or -1 for removal.
 func (f *Fs) indexFlatMedia(c *metadataCache, item api.Media, delta int) {
-	if c.flatNames == nil || item.SoftDeleted || item.Status == statusDeleted {
+	if c.flatNames == nil || item.IsDeleted() {
 		return
 	}
 	key := f.mediaKey(item)
@@ -1953,7 +1959,7 @@ func (f *Fs) projectFlatTree(ctx context.Context, items []api.Media, pending map
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if !sameParent(item.FolderID, f.opt.RootFolderID) || item.SoftDeleted || item.Status == statusDeleted || pending[item.ID] != nil {
+		if !sameParent(item.FolderID, f.opt.RootFolderID) || item.IsDeleted() || pending[item.ID] != nil {
 			continue
 		}
 		name := f.opt.Enc.ToStandardName(item.Name)
@@ -1965,10 +1971,7 @@ func (f *Fs) projectFlatTree(ctx context.Context, items []api.Media, pending map
 		}
 		full, directory, err := f.resolvedFlatName(f.mediaKey(item), paths)
 		if err != nil {
-			if strings.HasPrefix(name, "rclone-flat-") {
-				return nil, fmt.Errorf("invalid or unsupported flat namespace name for media %s: %w", item.ID, err)
-			}
-			continue
+			return nil, fmt.Errorf("invalid or unsupported flat namespace name for media %s: %w", item.ID, err)
 		}
 		if directory && item.Size != 0 {
 			return nil, fmt.Errorf("nonempty flat directory marker for media %s", item.ID)
@@ -2185,13 +2188,13 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 	}
 
 	if parent != "" && !slices.ContainsFunc(folders, func(folder api.Folder) bool {
-		return string(folder.ID) == parent && !folder.SoftDeleted && folder.Status != statusDeleted
+		return string(folder.ID) == parent && !folder.IsDeleted()
 	}) {
 		return nil, fs.ErrorDirNotFound
 	}
 	var entries fs.DirEntries
 	for _, folder := range folders {
-		if !sameParent(folder.ParentID, parent) || folder.Status == statusDeleted || folder.SoftDeleted {
+		if !sameParent(folder.ParentID, parent) || folder.IsDeleted() {
 			continue
 		}
 		remote := path.Join(dir, f.opt.Enc.ToStandardName(folder.Name))
@@ -2213,7 +2216,7 @@ func (f *Fs) folderPaths(ctx context.Context, folders []api.Folder, parent api.I
 	}
 	children := make(map[api.ID][]api.Folder, len(folders))
 	for _, folder := range folders {
-		if folder.SoftDeleted || folder.Status == statusDeleted {
+		if folder.IsDeleted() {
 			continue
 		}
 		id := folder.ParentID
@@ -2297,7 +2300,7 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) e
 		}
 	}
 	if parent != "" && parent != "0" && !slices.ContainsFunc(folders, func(folder api.Folder) bool {
-		return string(folder.ID) == parent && !folder.SoftDeleted && folder.Status != statusDeleted
+		return string(folder.ID) == parent && !folder.IsDeleted()
 	}) {
 		return fs.ErrorDirNotFound
 	}
@@ -2330,7 +2333,7 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) e
 		if parent == "0" {
 			parent = ""
 		}
-		if remote, found := paths[parent]; found && !item.SoftDeleted && item.Status != statusDeleted {
+		if remote, found := paths[parent]; found && !item.IsDeleted() {
 			return helper.Add(&Object{fs: f, remote: path.Join(remote, f.opt.Enc.ToStandardName(item.Name)), info: item})
 		}
 		return nil
@@ -2409,7 +2412,7 @@ func (f *Fs) notificationEntries(ctx context.Context, folders []api.Folder, item
 	entries := make(map[notificationKey]notificationEntry, len(folders)+len(items))
 	for _, folder := range folders {
 		remote, found := paths[folder.ID]
-		if !found || folder.SoftDeleted || folder.Status == statusDeleted {
+		if !found || folder.IsDeleted() {
 			continue
 		}
 		if remote, found = relative(remote); found {
@@ -2422,7 +2425,7 @@ func (f *Fs) notificationEntries(ctx context.Context, folders []api.Folder, item
 			parent = ""
 		}
 		remote, found := paths[parent]
-		if !found || item.SoftDeleted || item.Status == statusDeleted || pending[item.ID] != nil {
+		if !found || item.IsDeleted() || pending[item.ID] != nil {
 			continue
 		}
 		if remote, found = relative(path.Join(remote, f.opt.Enc.ToStandardName(item.Name))); found {
@@ -2582,11 +2585,11 @@ func (f *Fs) objectByName(ctx context.Context, remote, leaf, parent string, pend
 			return nil, errors.New("duplicate flat namespace file")
 		}
 		if parent != "" && !slices.ContainsFunc(c.state.Folders, func(folder api.Folder) bool {
-			return string(folder.ID) == parent && !folder.SoftDeleted && folder.Status != statusDeleted
+			return string(folder.ID) == parent && !folder.IsDeleted()
 		}) {
 			return nil, fs.ErrorObjectNotFound
 		}
-		if id, ok := c.byName[mediaKey{parent: parent, name: leaf}]; ok && pending[id] == nil {
+		if id, ok := c.byName[mediaKey{parent: parent, name: leaf}]; ok && !c.state.Media[id].IsDeleted() && pending[id] == nil {
 			return &Object{fs: f, remote: remote, info: c.state.Media[id]}, nil
 		}
 		return nil, fs.ErrorObjectNotFound
@@ -3560,7 +3563,7 @@ func (o *Object) completeUploadRecovery(r *uploadRecovery, data api.Upload) erro
 		return nil
 	}
 	if o.info.ID != r.record.ID || o.info.Size != data.Size || o.info.Name != data.Name ||
-		!sameParent(o.info.FolderID, string(data.FolderID)) || o.info.SoftDeleted || o.info.Status == statusDeleted || o.info.Status == "S" {
+		!sameParent(o.info.FolderID, string(data.FolderID)) || o.info.IsDeleted() {
 		return errors.New("validated upload metadata does not match the recovery record")
 	}
 	if err := r.fs.journalDo(true, &uploadJournalOp{key: r.key, remove: true}); err != nil {
@@ -3595,7 +3598,7 @@ func (o *Object) uploadAsync(ctx context.Context, in io.Reader, data api.Upload,
 					return errors.New("upload destination lookup returned an unexpected media ID")
 				}
 				found = true
-				if item.SoftDeleted || item.Status == statusDeleted || item.Status == "S" {
+				if item.IsDeleted() {
 					return errors.New("upload recovery item is deleted or in trash")
 				}
 				if item.Name != data.Name || !sameParent(item.FolderID, string(data.FolderID)) || allowInvisible && item.Size != data.Size {

@@ -772,6 +772,13 @@ func TestFlatCacheRestartProcess(t *testing.T) {
 	f := remote.(*Fs)
 	defer func() { require.NoError(t, f.Shutdown(ctx)) }()
 	if !request.Check {
+		if request.Mode == "legacy-trash" {
+			// Persist the shape of a cache populated before all trash statuses were filtered.
+			f.metadata.state.Media["90"] = api.Media{ID: "90", FolderID: "1", Name: "rclone-flat-unsupported", Status: "S"}
+			f.metadata.state.Media["91"] = api.Media{ID: "91", FolderID: "1", Name: flatFixtureName("gone.txt", false), Status: "S"}
+			f.metadata.state.Media["92"] = api.Media{ID: "92", FolderID: "1", Name: flatFixtureName("keep.txt", false), Status: "S"}
+			f.metadata.dirty = true
+		}
 		if request.Mode == "long-path" {
 			_, err := f.NewObject(ctx, request.Remote)
 			require.NoError(t, err)
@@ -779,6 +786,15 @@ func TestFlatCacheRestartProcess(t *testing.T) {
 		return
 	}
 	switch request.Mode {
+	case "legacy-trash":
+		entries, err := f.List(ctx, "")
+		require.NoError(t, err)
+		assert.Equal(t, []string{"keep.txt"}, flatEntryNames(entries))
+		_, err = f.NewObject(ctx, "gone.txt")
+		require.ErrorIs(t, err, fs.ErrorObjectNotFound)
+		obj, err := f.NewObject(ctx, "keep.txt")
+		require.NoError(t, err)
+		assert.EqualValues(t, 5, obj.Size(), "a deleted high-ID duplicate must not shadow the live file")
 	case "duplicate":
 		_, err := f.NewObject(ctx, "duplicate.txt")
 		require.ErrorContains(t, err, "duplicate")
@@ -812,10 +828,12 @@ func TestFlatCacheRestartProcess(t *testing.T) {
 
 func TestFlatPersistentCacheRebuildsDerivedIndexes(t *testing.T) {
 	helper := recoveryHelper(t)
-	for _, mode := range []string{"duplicate", "implicit-directory", "invalid-name"} {
+	for _, mode := range []string{"duplicate", "implicit-directory", "invalid-name", "legacy-trash"} {
 		t.Run(mode, func(t *testing.T) {
 			fx := newFlatFixture(t)
 			switch mode {
+			case "legacy-trash":
+				fx.media = []api.Media{{ID: "3", FolderID: "1", Name: flatFixtureName("keep.txt", false), Type: "file", Size: 5}}
 			case "duplicate":
 				fx.media = []api.Media{
 					{ID: "10", FolderID: "1", Name: flatFixtureName("duplicate.txt", false), Type: "file", Size: 1},

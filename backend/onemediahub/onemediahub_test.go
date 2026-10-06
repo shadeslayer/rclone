@@ -234,6 +234,68 @@ func TestMetadataCacheSoftDeletedChanges(t *testing.T) {
 	assert.Equal(t, fx.requestTime, f.metadata.state.Anchor)
 }
 
+func TestTrashedMetadataViews(t *testing.T) {
+	for _, cached := range []bool{false, true} {
+		t.Run(strconv.FormatBool(cached), func(t *testing.T) {
+			cacheDir := config.GetCacheDir()
+			require.NoError(t, config.SetCacheDir(t.TempDir()))
+			t.Cleanup(func() { require.NoError(t, config.SetCacheDir(cacheDir)) })
+			fx := newFixture(t)
+			fx.requestTime = 1700000000000
+			fx.folders = []api.Folder{{ID: "1", Name: "trash", Status: "S"}, {ID: "2", Name: "active"}}
+			fx.media = []api.Media{{ID: "3", FolderID: "1", Name: "hidden.txt"}, {ID: "4", Name: "keep.txt", Size: 5}}
+			fx.changes = map[string]api.Changes{"file": {New: []api.ID{"3", "4"}}}
+			m := fx.config(t)
+			m["metadata_cache"] = strconv.FormatBool(cached)
+			ctx := context.Background()
+			remote, err := NewFs(ctx, "trash-views", "", m)
+			require.NoError(t, err)
+			f := remote.(*Fs)
+			t.Cleanup(func() { require.NoError(t, f.Shutdown(ctx)) })
+			if cached {
+				// A cached trash record can survive a changes interval with no matching delta.
+				item := api.Media{ID: "90", Name: "gone.txt", Status: "S"}
+				f.metadata.state.Media[item.ID] = item
+				f.metadata.byName[f.mediaKey(item)] = item.ID
+			}
+			entries, err := f.List(ctx, "")
+			require.NoError(t, err)
+			assert.ElementsMatch(t, []string{"active/", "keep.txt"}, flatEntryNames(entries))
+			var recursive []string
+			require.NoError(t, f.ListR(ctx, "", func(entries fs.DirEntries) error {
+				recursive = append(recursive, flatEntryNames(entries)...)
+				return nil
+			}))
+			assert.ElementsMatch(t, []string{"active/", "keep.txt"}, recursive)
+			_, err = f.NewObject(ctx, "trash/hidden.txt")
+			require.ErrorIs(t, err, fs.ErrorObjectNotFound)
+			_, err = f.NewObject(ctx, "gone.txt")
+			require.ErrorIs(t, err, fs.ErrorObjectNotFound)
+		})
+	}
+}
+
+func TestMetadataCacheTrashedWrites(t *testing.T) {
+	fx := newFlatFixture(t)
+	f, ctx := flatTestFs(t, fx, "", true)
+	live := api.Media{ID: "3", FolderID: "1", Name: flatFixtureName("keep.txt", false), Size: 5}
+	f.cacheMedia(live, false)
+	for _, item := range []api.Media{
+		{ID: "90", FolderID: "1", Name: live.Name, Status: "S"},
+		{ID: "91", FolderID: "1", Name: live.Name, Status: "D"},
+		{ID: "92", FolderID: "1", Name: live.Name, SoftDeleted: true},
+	} {
+		f.cacheMedia(item, false)
+		obj, err := f.NewObject(ctx, "keep.txt")
+		require.NoError(t, err)
+		assert.EqualValues(t, 5, obj.Size())
+		f.cacheFolder(api.Folder{ID: item.ID, Name: "trash", Status: item.Status, SoftDeleted: item.SoftDeleted}, false)
+		folders, err := f.folders(ctx)
+		require.NoError(t, err)
+		assert.False(t, slices.ContainsFunc(folders, func(folder api.Folder) bool { return folder.ID == item.ID }))
+	}
+}
+
 func TestListR(t *testing.T) {
 	for _, cached := range []bool{false, true} {
 		for _, mode := range []string{"directory", "path-root", "id-root"} {

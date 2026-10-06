@@ -79,6 +79,11 @@ type Folder struct {
 	SoftDeleted bool   `json:"softdeleted,omitempty"` // SoftDeleted indicates a trashed folder.
 }
 
+// IsDeleted reports whether the folder is deleted or in the trash.
+func (f Folder) IsDeleted() bool {
+	return f.SoftDeleted || f.Status == "D" || f.Status == "S"
+}
+
 // Changes contains changed item IDs grouped by their server status.
 type Changes struct {
 	New     []ID `json:"N,omitempty"` // New identifies added items.
@@ -101,6 +106,11 @@ type Media struct {
 	Type        string `json:"mediatype"`        // Type is file, picture, video, or audio.
 	Status      string `json:"status"`           // Status is the upload status.
 	SoftDeleted bool   `json:"softdeleted"`      // SoftDeleted indicates a trashed item.
+}
+
+// IsDeleted reports whether the media item is deleted or in the trash.
+func (m Media) IsDeleted() bool {
+	return m.SoftDeleted || m.Status == "D" || m.Status == "S"
 }
 
 // Upload describes content being created or replaced.
