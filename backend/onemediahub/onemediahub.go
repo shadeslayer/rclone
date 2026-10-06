@@ -672,10 +672,10 @@ func (op *metadataOp) Do(_ context.Context, bucket kv.Bucket) error {
 	return bucket.Put(key, b)
 }
 
-func (f *Fs) startMetadataCache(ctx context.Context) error {
+func (f *Fs) accountID(ctx context.Context) (string, error) {
 	reply, err := f.request(ctx, http.MethodGet, "/profile", "get", nil, nil)
 	if err != nil {
-		return err
+		return "", err
 	}
 	var profile struct {
 		User struct {
@@ -685,15 +685,23 @@ func (f *Fs) startMetadataCache(ctx context.Context) error {
 		} `json:"user"`
 	}
 	if err := json.Unmarshal(reply.Data, &profile); err != nil {
-		return err
+		return "", err
 	}
 	if profile.User.Generic.ID == "" {
-		return errors.New("profile returned no account ID")
+		return "", errors.New("profile returned no account ID")
+	}
+	return profile.User.Generic.ID, nil
+}
+
+func (f *Fs) startMetadataCache(ctx context.Context) error {
+	id, err := f.accountID(ctx)
+	if err != nil {
+		return err
 	}
 	f.metadata = &metadataCache{}
 	if kv.Supported() {
 		// Token rotation must not change the account's cache namespace.
-		scope, _ := json.Marshal([]string{strings.TrimRight(f.opt.URL, "/"), f.opt.APIPath, profile.User.Generic.ID})
+		scope, _ := json.Marshal([]string{strings.TrimRight(f.opt.URL, "/"), f.opt.APIPath, id})
 		digest := sha256.Sum256(scope)
 		db, err := kv.Start(ctx, fmt.Sprintf("onemediahub-%x", digest[:]), f)
 		if err != nil {
@@ -1197,6 +1205,118 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		f.expireMetadata()
 	}
 	return err
+}
+
+// DirMove moves a directory on the same account, returning ErrorDirExists for an existing destination.
+func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
+	srcFs, ok := src.(*Fs)
+	if !ok || strings.TrimRight(f.opt.URL, "/") != strings.TrimRight(srcFs.opt.URL, "/") || f.opt.APIPath != srcFs.opt.APIPath {
+		return fs.ErrorCantDirMove
+	}
+	if srcFs != f {
+		srcAccount, err := srcFs.accountID(ctx)
+		if err != nil {
+			return err
+		}
+		dstAccount, err := f.accountID(ctx)
+		if err != nil {
+			return err
+		}
+		if srcAccount != dstAccount {
+			return fs.ErrorCantDirMove
+		}
+	}
+	f.expireMetadata()
+	if err := f.syncMetadata(ctx); err != nil {
+		return err
+	}
+	if srcFs != f {
+		srcFs.expireMetadata()
+		if err := srcFs.syncMetadata(ctx); err != nil {
+			return err
+		}
+	}
+	f.dirCache.ResetRoot()
+	if srcFs != f {
+		srcFs.dirCache.ResetRoot()
+	}
+	srcID, err := srcFs.dirCache.FindDir(ctx, srcRemote, false)
+	if err != nil {
+		return err
+	}
+	if _, err := f.dirCache.FindDir(ctx, dstRemote, false); err == nil {
+		return fs.ErrorDirExists
+	} else if !errors.Is(err, fs.ErrorDirNotFound) {
+		return err
+	}
+	// Check the closest existing ancestor before creating destination parents.
+	ancestor := path.Dir(path.Join(f.root, dstRemote))
+	if ancestor == "." {
+		ancestor = ""
+	}
+	var parentID string
+	dstRootCache := dircache.New("", f.opt.RootFolderID, f)
+	for {
+		parentID, err = dstRootCache.FindDir(ctx, ancestor, false)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, fs.ErrorDirNotFound) || ancestor == "" {
+			return err
+		}
+		ancestor = path.Dir(ancestor)
+		if ancestor == "." {
+			ancestor = ""
+		}
+	}
+	folders, err := f.folders(ctx)
+	if err != nil {
+		return err
+	}
+	parents := map[api.ID]api.ID{}
+	for _, folder := range folders {
+		parents[folder.ID] = folder.ParentID
+	}
+	seen := map[api.ID]bool{}
+	for id := api.ID(parentID); id != "" && id != "0"; id = parents[id] {
+		if string(id) == srcID {
+			return errors.New("cannot move a directory into itself")
+		}
+		if seen[id] {
+			return errors.New("folder ancestry contains a cycle")
+		}
+		seen[id] = true
+		if _, ok := parents[id]; !ok {
+			return fs.ErrorCantDirMove
+		}
+	}
+	srcID, _, _, dstParent, dstLeaf, err := f.dirCache.DirMove(ctx, srcFs.dirCache, srcFs.root, srcRemote, f.root, dstRemote)
+	if err != nil {
+		return err
+	}
+	folder := api.Folder{ID: api.ID(srcID), ParentID: api.ID(dstParent), Name: f.opt.Enc.FromStandardName(dstLeaf)}
+	reply, err := f.request(ctx, http.MethodPost, "/media/folder", "save", nil, folder)
+	if err == nil && reply.ID != "" && reply.ID != folder.ID {
+		err = errors.New("folder move returned an unexpected ID")
+	}
+	if err != nil {
+		f.expireMetadata()
+		srcFs.expireMetadata()
+		f.dirCache.ResetRoot()
+		if srcFs != f {
+			srcFs.dirCache.ResetRoot()
+		}
+		return err
+	}
+	f.cacheFolder(folder, false)
+	if srcFs != f {
+		srcFs.cacheFolder(folder, false)
+	}
+	f.dirCache.ResetRoot()
+	if srcFs != f {
+		srcFs.dirCache.ResetRoot()
+	}
+	return nil
 }
 
 // Put creates or replaces an object and preserves its upload modification time.
@@ -1709,5 +1829,6 @@ var (
 	_ fs.IDer            = (*Object)(nil)
 	_ fs.Abouter         = (*Fs)(nil)
 	_ fs.Shutdowner      = (*Fs)(nil)
+	_ fs.DirMover        = (*Fs)(nil)
 	_ dircache.DirCacher = (*Fs)(nil)
 )

@@ -188,6 +188,46 @@ func TestMetadataCache(t *testing.T) {
 	assert.ErrorIs(t, f.Rmdir(ctx, "external"), fs.ErrorDirectoryNotEmpty)
 }
 
+func TestDirMove(t *testing.T) {
+	for _, cached := range []bool{false, true} {
+		t.Run(strconv.FormatBool(cached), func(t *testing.T) {
+			cacheDir := config.GetCacheDir()
+			require.NoError(t, config.SetCacheDir(t.TempDir()))
+			t.Cleanup(func() { require.NoError(t, config.SetCacheDir(cacheDir)) })
+			ctx := context.Background()
+			fx := newFixture(t)
+			fx.requestTime = 1700000000123
+			fx.changes = map[string]api.Changes{"file": {New: []api.ID{"4"}}}
+			fx.folders = []api.Folder{{ID: "1", Name: "old"}, {ID: "2", ParentID: "1", Name: "child"}, {ID: "3", Name: "destination"}}
+			fx.media = []api.Media{{ID: "4", FolderID: "2", Name: "file", Size: 1}}
+			m := fx.config(t)
+			m["metadata_cache"] = strconv.FormatBool(cached)
+			remote, err := NewFs(ctx, "move", "", m)
+			require.NoError(t, err)
+			f := remote.(*Fs)
+			t.Cleanup(func() { require.NoError(t, f.Shutdown(ctx)) })
+			move := f.Features().DirMove
+			require.NotNil(t, move)
+			_, err = f.NewObject(ctx, "old/child/file")
+			require.NoError(t, err)
+			assert.ErrorIs(t, move(ctx, f, "old", "destination"), fs.ErrorDirExists)
+			before := len(fx.folders)
+			require.Error(t, move(ctx, f, "old", "old/child/new/deeper"))
+			assert.Len(t, fx.folders, before)
+			require.Error(t, move(ctx, f, "", "root"))
+			require.NoError(t, move(ctx, f, "old", "destination/renamed"))
+			obj, err := f.NewObject(ctx, "destination/renamed/child/file")
+			require.NoError(t, err)
+			assert.Equal(t, "4", obj.(*Object).ID())
+			_, err = f.NewObject(ctx, "old/child/file")
+			assert.ErrorIs(t, err, fs.ErrorObjectNotFound)
+			assert.Equal(t, api.ID("1"), fx.folders[0].ID)
+			assert.Equal(t, api.ID("3"), fx.folders[0].ParentID)
+			assert.Zero(t, fx.requests["/sapi/upload"])
+		})
+	}
+}
+
 func TestMetadataCacheDeletedRoot(t *testing.T) {
 	cacheDir := config.GetCacheDir()
 	require.NoError(t, config.SetCacheDir(t.TempDir()))
@@ -216,6 +256,49 @@ func TestMetadataCacheDeletedRoot(t *testing.T) {
 	f.metadata.mu.Unlock()
 	_, err = f.NewObject(ctx, "file")
 	assert.ErrorIs(t, err, fs.ErrorObjectNotFound)
+}
+
+func TestDirMoveAcrossAccounts(t *testing.T) {
+	ctx := context.Background()
+	fx := newFixture(t)
+	fx.folders = []api.Folder{{ID: "1", Name: "source"}, {ID: "2", Name: "destination"}}
+	src, err := NewFs(ctx, "source-account", "", fx.config(t))
+	require.NoError(t, err)
+	dst, err := NewFs(ctx, "destination-account", "", fx.config(t))
+	require.NoError(t, err)
+	handler := fx.server.Config.Handler
+	fx.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/sapi/profile" {
+			id := r.Header.Get(deviceHeader)
+			jsonReply(t, w, map[string]any{"data": map[string]any{"user": map[string]any{"generic": map[string]string{"userid": id}}}})
+			return
+		}
+		handler.ServeHTTP(w, r)
+	})
+	assert.ErrorIs(t, dst.Features().DirMove(ctx, src, "source", "destination/moved"), fs.ErrorCantDirMove)
+	assert.Equal(t, "source", fx.folders[0].Name)
+}
+
+func TestDirMoveAcrossRoots(t *testing.T) {
+	ctx := context.Background()
+	fx := newFixture(t)
+	fx.folders = []api.Folder{{ID: "1", Name: "source"}, {ID: "2", ParentID: "1", Name: "child"}, {ID: "3", Name: "destination"}}
+	m := fx.config(t)
+	src, err := NewFs(ctx, "move", "", m)
+	require.NoError(t, err)
+	m["root_folder_id"] = "2"
+	dst, err := NewFs(ctx, "move", "", m)
+	require.NoError(t, err)
+	before := len(fx.folders)
+	require.ErrorContains(t, dst.Features().DirMove(ctx, src, "source", "new/deeper"), "into itself")
+	assert.Len(t, fx.folders, before)
+	// Independent roots in the same account may move a whole tree.
+	m["root_folder_id"] = "3"
+	dst, err = NewFs(ctx, "move", "", m)
+	require.NoError(t, err)
+	require.NoError(t, dst.Features().DirMove(ctx, src, "source", "moved"))
+	_, err = dst.List(ctx, "moved/child")
+	require.NoError(t, err)
 }
 
 func TestMetadataCacheFolderDeltas(t *testing.T) {
@@ -756,15 +839,24 @@ func (fx *fixture) serve(t *testing.T, w http.ResponseWriter, r *http.Request) {
 			ParentID *int64          `json:"parentid"`
 		}
 		require.NoError(t, json.Unmarshal(envelope.Data, &data))
-		assert.Empty(t, data.ID)
 		require.NotEmpty(t, data.Name)
 		folder := api.Folder{Name: data.Name, Status: "U", Date: time.Now().UnixMilli()}
 		if data.ParentID != nil {
 			folder.ParentID = api.ID(strconv.FormatInt(*data.ParentID, 10))
 		}
-		folder.ID = api.ID(strconv.Itoa(fx.nextID))
-		fx.nextID++
-		fx.folders = append(fx.folders, folder)
+		if len(data.ID) != 0 {
+			require.NoError(t, json.Unmarshal(data.ID, &folder.ID))
+			for i, old := range fx.folders {
+				if old.ID == folder.ID {
+					fx.folders[i] = folder
+					break
+				}
+			}
+		} else {
+			folder.ID = api.ID(strconv.Itoa(fx.nextID))
+			fx.nextID++
+			fx.folders = append(fx.folders, folder)
+		}
 		jsonReply(t, w, map[string]any{"id": folder.ID, "success": "Folder saved successfully"})
 	case r.URL.Path == "/sapi/media/folder" && action == "delete":
 		assert.Equal(t, http.MethodPost, r.Method)
