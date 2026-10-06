@@ -362,6 +362,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	f.auth = &auth{name: name, opt: opt, m: m, srv: srv, httpClient: client}
 	f.features = (&fs.Features{CanHaveEmptyDirectories: true}).Fill(ctx, f)
 	f.dirCache = dircache.New(f.root, opt.RootFolderID, f)
+	keepFs := false
+	defer func() {
+		if !keepFs {
+			_ = f.Shutdown(ctx)
+		}
+	}()
 	info, err := serverInfo(ctx, srv)
 	if err != nil {
 		return nil, err
@@ -391,12 +397,6 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			return nil, fmt.Errorf("start metadata cache: %w", err)
 		}
 	}
-	keepCache := false
-	defer func() {
-		if !keepCache {
-			_ = f.Shutdown(ctx)
-		}
-	}()
 	if opt.AsyncUpload {
 		validationCtx, cancel := context.WithCancel(context.Background())
 		f.validationCancel = cancel
@@ -410,7 +410,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	err = f.dirCache.FindRoot(ctx, false)
 	if err == nil {
-		keepCache = true
+		keepFs = true
 		return f, nil
 	}
 
@@ -423,12 +423,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	f.dirCache = dircache.New(parent, opt.RootFolderID, f)
 	_, err = f.NewObject(ctx, leaf)
 	if err == nil {
-		keepCache = true
+		keepFs = true
 		return f, fs.ErrorIsFile
 	}
 	f.root, f.dirCache = originalRoot, originalCache
 	if errors.Is(err, fs.ErrorObjectNotFound) || errors.Is(err, fs.ErrorDirNotFound) {
-		keepCache = true
+		keepFs = true
 		return f, nil
 	}
 	return nil, err
@@ -526,9 +526,7 @@ func (f *Fs) send(ctx context.Context, opts rest.Opts, request any, state authSt
 		attemptOpts.Parameters.Set("validationkey", session.Key)
 	}
 	attemptOpts.ExtraHeaders = map[string]string{}
-	for key, value := range opts.ExtraHeaders {
-		attemptOpts.ExtraHeaders[key] = value
-	}
+	maps.Copy(attemptOpts.ExtraHeaders, opts.ExtraHeaders)
 	cookie := &http.Cookie{Name: sessionCookie, Value: session.ID}
 	attemptOpts.ExtraHeaders["Cookie"] = cookie.String()
 	if state.header != "" {
@@ -549,19 +547,15 @@ func (f *Fs) send(ctx context.Context, opts rest.Opts, request any, state authSt
 		return reply, resp, saveErr
 	}
 
-	if err == nil {
-		if opts.NoResponse {
-			return reply, resp, nil
-		}
-		b, readErr := rest.ReadBody(resp)
-		err = readErr
-		if err == nil && len(strings.TrimSpace(string(b))) != 0 {
-			err = json.Unmarshal(b, &reply)
-		}
-
-		if err == nil && reply.Error != nil {
-			err = reply.Error
-		}
+	if err != nil || opts.NoResponse {
+		return reply, resp, err
+	}
+	b, err := rest.ReadBody(resp)
+	if err == nil && len(bytes.TrimSpace(b)) != 0 {
+		err = json.Unmarshal(b, &reply)
+	}
+	if err == nil && reply.Error != nil {
+		err = reply.Error
 	}
 	return reply, resp, err
 }
@@ -744,11 +738,7 @@ func (f *Fs) startMetadataCache(ctx context.Context) error {
 			fs.Debugf(f, "Loaded metadata cache")
 		}
 	}
-	if err := f.syncMetadata(ctx); err != nil {
-		_ = f.Shutdown(ctx)
-		return err
-	}
-	return nil
+	return f.syncMetadata(ctx)
 }
 
 func (f *Fs) changes(ctx context.Context, anchor int64) (map[string]api.Changes, int64, error) {
@@ -775,19 +765,17 @@ func (f *Fs) changes(ctx context.Context, anchor int64) (map[string]api.Changes,
 	if err := json.Unmarshal(reply.Data, &raw); err != nil || raw == nil {
 		return nil, 0, errors.New("changes API returned invalid changes")
 	}
-	for source, changes := range raw {
+	changes := make(map[string]api.Changes, len(raw))
+	for source, statuses := range raw {
 		if !slices.Contains([]string{"folder", "file", "picture", "video", "audio"}, source) {
 			return nil, 0, fmt.Errorf("changes API returned unsupported source %q", source)
 		}
-		for status := range changes {
+		for status := range statuses {
 			if !slices.Contains([]string{"N", "U", "D", "L"}, status) {
 				return nil, 0, fmt.Errorf("changes API returned unsupported status %q", status)
 			}
 		}
-	}
-	var changes map[string]api.Changes
-	if err := json.Unmarshal(reply.Data, &changes); err != nil {
-		return nil, 0, err
+		changes[source] = api.Changes{New: statuses["N"], Updated: statuses["U"], Deleted: statuses["D"], Locked: statuses["L"]}
 	}
 	return changes, timestamp, nil
 }
@@ -965,7 +953,7 @@ func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
 	return foldersChanged, nil
 }
 
-// Shutdown closes the persistent metadata cache.
+// Shutdown stops upload validation and closes the persistent metadata cache.
 func (f *Fs) Shutdown(ctx context.Context) error {
 	if f.validationCancel != nil {
 		f.validationCancel()
@@ -980,7 +968,7 @@ func (f *Fs) Shutdown(ctx context.Context) error {
 		defer c.mu.Unlock()
 		if c.db != nil && !c.db.IsStopped() {
 			var err error
-			if c.state != nil {
+			if c.dirty {
 				err = c.db.Do(true, &metadataOp{state: c.state, write: true})
 			}
 			err = errors.Join(err, c.db.Stop(false))
@@ -1281,19 +1269,16 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 			return fs.ErrorCantDirMove
 		}
 	}
-	f.expireMetadata()
-	if err := f.syncMetadata(ctx); err != nil {
-		return err
-	}
+	remotes := []*Fs{f}
 	if srcFs != f {
-		srcFs.expireMetadata()
-		if err := srcFs.syncMetadata(ctx); err != nil {
+		remotes = append(remotes, srcFs)
+	}
+	for _, remote := range remotes {
+		remote.expireMetadata()
+		if err := remote.syncMetadata(ctx); err != nil {
 			return err
 		}
-	}
-	f.dirCache.ResetRoot()
-	if srcFs != f {
-		srcFs.dirCache.ResetRoot()
+		remote.dirCache.ResetRoot()
 	}
 	srcID, err := srcFs.dirCache.FindDir(ctx, srcRemote, false)
 	if err != nil {
@@ -1354,24 +1339,15 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	if err == nil && reply.ID != "" && reply.ID != folder.ID {
 		err = errors.New("folder move returned an unexpected ID")
 	}
-	if err != nil {
-		f.expireMetadata()
-		srcFs.expireMetadata()
-		f.dirCache.ResetRoot()
-		if srcFs != f {
-			srcFs.dirCache.ResetRoot()
+	for _, remote := range remotes {
+		if err != nil {
+			remote.expireMetadata()
+		} else {
+			remote.cacheFolder(folder, false)
 		}
-		return err
+		remote.dirCache.ResetRoot()
 	}
-	f.cacheFolder(folder, false)
-	if srcFs != f {
-		srcFs.cacheFolder(folder, false)
-	}
-	f.dirCache.ResetRoot()
-	if srcFs != f {
-		srcFs.dirCache.ResetRoot()
-	}
-	return nil
+	return err
 }
 
 // Put creates or replaces an object and preserves its upload modification time.
@@ -1508,13 +1484,12 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	}
 	options = slices.Clone(options)
 	fs.FixRangeOption(options, o.Size())
+	base, _ := url.Parse(o.fs.opt.URL + "/")
 	for attempt := range 2 {
-		u, err := url.Parse(rawURL)
+		u, err := rest.URLJoin(base, rawURL)
 		if err != nil || rawURL == "" {
 			return nil, errors.New("invalid media download URL")
 		}
-		base, _ := url.Parse(o.fs.opt.URL + "/")
-		u = base.ResolveReference(u)
 		if u.Scheme != "http" && u.Scheme != "https" {
 			return nil, errors.New("unsupported download URL scheme")
 		}
@@ -1975,20 +1950,12 @@ func (f *Fs) checkUploads(ctx context.Context, items []validationItem, results [
 // Remove moves the media item to the trash.
 func (o *Object) Remove(ctx context.Context) error {
 	o.fs.downloadURLs.DeletePrefix(string(o.info.ID) + "/")
-	var field string
 	switch o.info.Type {
-	case "picture":
-		field = "pictures"
-	case "video":
-		field = "videos"
-	case "audio":
-		field = "audios"
-	case "file":
-		field = "files"
+	case "picture", "video", "audio", "file":
 	default:
 		return fmt.Errorf("unsupported media type %q", o.info.Type)
 	}
-	_, err := o.fs.request(ctx, http.MethodPost, "/media/"+o.info.Type, "delete", url.Values{"softdelete": {"true"}}, map[string]any{field: []api.ID{o.info.ID}})
+	_, err := o.fs.request(ctx, http.MethodPost, "/media/"+o.info.Type, "delete", url.Values{"softdelete": {"true"}}, map[string]any{o.info.Type + "s": []api.ID{o.info.ID}})
 	if err == nil {
 		o.fs.cacheMedia(o.info, true)
 	} else {

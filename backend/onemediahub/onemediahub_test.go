@@ -374,6 +374,53 @@ func TestMetadataCacheDeletedRoot(t *testing.T) {
 	assert.ErrorIs(t, err, fs.ErrorObjectNotFound)
 }
 
+func TestMetadataCacheShutdown(t *testing.T) {
+	for _, localWrite := range []bool{false, true} {
+		t.Run(strconv.FormatBool(localWrite), func(t *testing.T) {
+			cacheDir := config.GetCacheDir()
+			require.NoError(t, config.SetCacheDir(t.TempDir()))
+			t.Cleanup(func() { require.NoError(t, config.SetCacheDir(cacheDir)) })
+			ctx := context.Background()
+			fx := newFixture(t)
+			fx.requestTime = 1700000000123
+			fx.changes = map[string]api.Changes{}
+			m := fx.config(t)
+			m["metadata_cache"] = "true"
+			remote, err := NewFs(ctx, "shutdown-test", "", m)
+			require.NoError(t, err)
+			f := remote.(*Fs)
+			t.Cleanup(func() { require.NoError(t, f.Shutdown(ctx)) })
+			before := &snapshotBytes{}
+			require.NoError(t, f.metadata.db.Do(false, before))
+			fx.mu.Lock()
+			fx.requestTime += 1000
+			fx.mu.Unlock()
+			f.expireMetadata()
+			require.NoError(t, f.syncMetadata(ctx))
+			// Keep the database open while the first filesystem shuts down.
+			peer, err := NewFs(ctx, "shutdown-test", "", m)
+			require.NoError(t, err)
+			peerFs := peer.(*Fs)
+			t.Cleanup(func() { require.NoError(t, peerFs.Shutdown(ctx)) })
+			if localWrite {
+				require.NoError(t, f.Mkdir(ctx, "created"))
+			}
+			require.NoError(t, f.Shutdown(ctx))
+			loaded := &metadataOp{}
+			require.NoError(t, peerFs.metadata.db.Do(false, loaded))
+			assert.Equal(t, fx.requestTime, loaded.state.Anchor)
+			if localWrite {
+				require.Len(t, loaded.state.Folders, 1)
+				assert.Equal(t, "created", loaded.state.Folders[0].Name)
+			} else {
+				after := &snapshotBytes{}
+				require.NoError(t, peerFs.metadata.db.Do(false, after))
+				assert.Equal(t, before.data, after.data, "shutdown rewrote unchanged metadata")
+			}
+		})
+	}
+}
+
 func TestDirMoveAcrossAccounts(t *testing.T) {
 	ctx := context.Background()
 	fx := newFixture(t)
@@ -2097,6 +2144,43 @@ func TestAPIErrors(t *testing.T) {
 	_, err = f.List(context.Background(), "")
 	require.ErrorContains(t, err, "COM-1011")
 	assert.EqualValues(t, 2, reads.Load())
+}
+
+func TestAPIResponseBodies(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		wantError  bool
+	}{
+		{"empty", "", false},
+		{"whitespace", " \r\n\t", false},
+		{"object", "{}", false},
+		{"API failure", `{"error":{"code":"COM-1011","message":"Invalid request"}}`, true},
+		{"truncated", `{"data":`, true},
+		{"trailing data", `{} invalid`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newFixture(t)
+			fx.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Get("action") == "delete" {
+					_, err := io.WriteString(w, tc.body)
+					assert.NoError(t, err)
+					return
+				}
+				fx.serve(t, w, r)
+			})
+			ctx := context.Background()
+			remote, err := NewFs(ctx, "response-test", "", fx.config(t))
+			require.NoError(t, err)
+			f := remote.(*Fs)
+			t.Cleanup(func() { require.NoError(t, f.Shutdown(ctx)) })
+			_, err = f.request(ctx, http.MethodPost, "/media/file", "delete", nil, map[string]any{"files": []api.ID{"1"}})
+			if tc.wantError {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }
 
 func TestHTTPErrorContext(t *testing.T) {
