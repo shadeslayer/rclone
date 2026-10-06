@@ -124,6 +124,14 @@ type Upload struct {
 	Modified    string `json:"modificationdate"`   // Modified is an RFC 2445 UTC date.
 }
 
+// MetadataUpdate describes a file rename, parent move, or timestamp update without content replacement.
+type MetadataUpdate struct {
+	ID       string `json:"id"`               // ID identifies the existing media item.
+	FolderID ID     `json:"folderid"`         // FolderID identifies the destination parent, with zero for the root.
+	Name     string `json:"name"`             // Name is the filename.
+	Modified string `json:"modificationdate"` // Modified is an RFC 2445 UTC date.
+}
+
 // ServerInfo contains public deployment settings.
 type ServerInfo struct {
 	UploadURL string `json:"sapi.upload.endpoint"` // UploadURL is the dedicated upload server, if any.

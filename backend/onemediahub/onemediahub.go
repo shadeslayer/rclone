@@ -1277,7 +1277,7 @@ func (f *Fs) fetchFolders(ctx context.Context, ids []api.ID) ([]api.Folder, erro
 }
 
 func sameParent(id api.ID, parent string) bool {
-	return string(id) == parent || parent == "" && id == "0"
+	return string(id) == parent || (id == "" || id == "0") && (parent == "" || parent == "0")
 }
 
 // FindLeaf finds a child directory for dircache.
@@ -2858,6 +2858,78 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	return err
 }
 
+// Move renames or moves a file on the same account without transferring its content.
+func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	source, ok := src.(*Object)
+	if !ok || f.opt.FlatNamespace != source.fs.opt.FlatNamespace || strings.TrimRight(f.opt.URL, "/") != strings.TrimRight(source.fs.opt.URL, "/") || f.opt.APIPath != source.fs.opt.APIPath {
+		return nil, fs.ErrorCantMove
+	}
+	if source.fs != f {
+		srcAccount, err := source.fs.accountID(ctx)
+		if err != nil {
+			return nil, err
+		}
+		dstAccount, err := f.accountID(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if srcAccount != dstAccount {
+			return nil, fs.ErrorCantMove
+		}
+	}
+	if source.fs != f {
+		if err := f.flushDeletions(ctx); err != nil {
+			return nil, err
+		}
+	}
+	if err := source.prepareMetadataUpdate(ctx); err != nil {
+		return nil, err
+	}
+	existing, err := f.newObject(ctx, remote, true)
+	if err == nil {
+		if existing.(*Object).info.ID == source.info.ID {
+			return existing, nil
+		}
+		return nil, errors.New("move destination already exists")
+	}
+	if !errors.Is(err, fs.ErrorObjectNotFound) {
+		return nil, err
+	}
+	leaf, parent, err := f.objectPath(ctx, remote, true)
+	if err != nil {
+		return nil, err
+	}
+	pending, err := f.pendingUploads()
+	if err != nil {
+		return nil, err
+	}
+	name := f.opt.Enc.FromStandardName(leaf)
+	for _, record := range pending {
+		if record.Name == name && sameParent(record.FolderID, parent) {
+			return nil, errors.New("move destination has an unfinished upload")
+		}
+	}
+	var mapping *Object
+	if source.fs != f && f.opt.FlatNamespace && strings.HasPrefix(leaf, flatPrefix+"f-h-") {
+		full, _ := f.flatPath(remote)
+		mapping, err = f.objectByName(ctx, full, flatMappingName(full), parent, nil)
+		if err != nil {
+			return nil, err
+		}
+	}
+	destination := &Object{fs: f, remote: remote, info: source.info}
+	err = destination.saveMetadata(ctx, name, api.ID(parent), source.ModTime(ctx))
+	if err != nil {
+		source.fs.expireMetadata()
+		return nil, err
+	}
+	if mapping != nil {
+		source.fs.cacheMedia(mapping.info, false)
+	}
+	source.fs.cacheMedia(destination.info, false)
+	return destination, nil
+}
+
 // Put creates or replaces an object and preserves its upload modification time.
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, opts ...fs.OpenOption) (fs.Object, error) {
 	if err := checkResumeUploadOptions(ctx, f.opt); err != nil {
@@ -2927,8 +2999,77 @@ func (o *Object) Storable() bool { return true }
 // Hash returns ErrUnsupported because SAPI does not specify content hashes.
 func (o *Object) Hash(context.Context, hash.Type) (string, error) { return "", hash.ErrUnsupported }
 
-// SetModTime returns ErrorCantSetModTime; timestamps can only be set on upload.
-func (o *Object) SetModTime(context.Context, time.Time) error { return fs.ErrorCantSetModTime }
+// SetModTime updates the timestamp without transferring content.
+func (o *Object) SetModTime(ctx context.Context, modified time.Time) error {
+	if err := o.prepareMetadataUpdate(ctx); err != nil {
+		return err
+	}
+	return o.saveMetadata(ctx, o.info.Name, o.info.FolderID, modified)
+}
+
+func (o *Object) prepareMetadataUpdate(ctx context.Context) error {
+	if err := o.fs.flushDeletions(ctx); err != nil {
+		return err
+	}
+	pending, err := o.fs.pendingUploads()
+	if err != nil {
+		return err
+	}
+	if pending[o.info.ID] != nil {
+		return errors.New("cannot change metadata of an unfinished upload")
+	}
+	before := o.info
+	current := *o
+	if err := current.refresh(ctx); err != nil {
+		return err
+	}
+	if before.Name != current.info.Name || !sameParent(current.info.FolderID, string(before.FolderID)) {
+		return errors.New("file was moved or renamed since it was read")
+	}
+	o.info = current.info
+	return nil
+}
+
+func (o *Object) saveMetadata(ctx context.Context, name string, parent api.ID, modified time.Time) (err error) {
+	defer func() {
+		if err != nil {
+			o.fs.expireMetadata()
+		}
+	}()
+	if parent == "" {
+		parent = "0"
+	}
+	data := api.MetadataUpdate{ID: string(o.info.ID), FolderID: parent, Name: name, Modified: modified.UTC().Format(dateFormat)}
+	reply, err := o.fs.call(ctx, rest.Opts{Method: http.MethodPost, RootURL: o.fs.uploadURL, Path: "/upload/file", Parameters: url.Values{"action": {"save-metadata"}}, ContentType: "application/octet-stream"}, map[string]any{"data": data})
+	if err != nil {
+		return err
+	}
+	if reply.ID != o.info.ID {
+		return errors.New("metadata update returned an unexpected media ID")
+	}
+	size := o.info.Size
+	ctx, cancel := context.WithTimeout(ctx, metadataTimeout)
+	defer cancel()
+	delay := metadataDelay
+	current := *o
+	for {
+		err = current.refresh(ctx)
+		if err != nil && !errors.Is(err, fs.ErrorObjectNotFound) {
+			return err
+		}
+		if err == nil && current.info.Name == name && sameParent(current.info.FolderID, string(parent)) && current.info.Size == size && current.info.Modified == modified.UTC().Truncate(time.Second).UnixMilli() {
+			o.info = current.info
+			o.fs.cacheMedia(o.info, false)
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for metadata update: %w", ctx.Err())
+		case <-time.After(delay):
+		}
+		delay = min(2*delay, metadataMaxDelay)
+	}
+}
 
 // ID returns the SAPI media identifier.
 func (o *Object) ID() string { return string(o.info.ID) }
@@ -4243,6 +4384,7 @@ var (
 	_ fs.Abouter         = (*Fs)(nil)
 	_ fs.Shutdowner      = (*Fs)(nil)
 	_ fs.DirMover        = (*Fs)(nil)
+	_ fs.Mover           = (*Fs)(nil)
 	_ fs.ListRer         = (*Fs)(nil)
 	_ fs.ChangeNotifier  = (*Fs)(nil)
 	_ dircache.DirCacher = (*Fs)(nil)
