@@ -1,0 +1,24 @@
+OneMediaHub implementation tasks
+
+[x] Fix flat-namespace copy/sync failures when crypt wraps the backend
+
+O2 appends a numbered suffix when concurrent creators upload identical
+virtual directory markers. Serialize marker creation within each filesystem
+and recognize numbered copies of canonical empty directory markers. Preserve
+raw metadata identity and reject ambiguous file names, mappings and names at
+the provider truncation limit.
+
+Validation:
+  - Regression fixtures reproduced the original failure before the fix.
+  - Crypt listing, lookup, replacement, deletion and content round trips pass
+    with filename encryption enabled and disabled, and metadata caching on/off.
+  - Actual copy/sync commands pass across process restarts with --fast-list,
+    including thumbnail/preview paths and long paths using remote mappings.
+  - Live O2 numbered-marker creation and projection passed; owned test entries
+    were deleted afterward. Existing account files were not changed.
+
+[ ] Complete the final backend cleanup and consistent trash filtering
+
+Reuse existing rclone frameworks, preserve raw upload/source identities, and
+remove repeated provider-specific deletion checks without weakening validation.
+Review every commit adversarially before committing.

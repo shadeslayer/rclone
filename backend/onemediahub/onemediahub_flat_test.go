@@ -348,6 +348,127 @@ func TestFlatMalformedOwnedNames(t *testing.T) {
 	}
 }
 
+func TestFlatProviderNumberedDirectoryMarkers(t *testing.T) {
+	for _, cached := range []bool{false, true} {
+		for _, full := range []string{"upload/upload", strings.Repeat("long-directory/", 16) + "empty"} {
+			t.Run(fmt.Sprintf("cached=%v/long=%v", cached, len(full) > 100), func(t *testing.T) {
+				fx := newFlatFixture(t)
+				fx.nextID = 100
+				name, err := flatName(full, true)
+				require.NoError(t, err)
+				fx.media = []api.Media{
+					{ID: "20", FolderID: "1", Name: name, Type: "file"},
+					{ID: "21", FolderID: "1", Name: name + " (1)", Type: "file", Status: "U"},
+					{ID: "22", FolderID: "1", Name: name + " (2)", Type: "file", Status: "U"},
+				}
+				if strings.Contains(name, "-d-h-") {
+					body := flatMappingFixture(t, full)
+					fx.media = append(fx.media, api.Media{ID: "23", FolderID: "1", Name: flatMappingName(full), Size: int64(len(body)), Type: "file", URL: fx.server.URL + "/content/23"})
+					fx.content["23"] = string(body)
+				}
+				f, ctx := flatTestFs(t, fx, "", cached)
+				entries, err := f.List(ctx, path.Dir(full))
+				require.NoError(t, err)
+				assert.Equal(t, []string{full + "/"}, flatEntryNames(entries))
+				require.NoError(t, f.Mkdir(ctx, full))
+				src := object.NewStaticObjectInfo(full+"/preview.jpeg", time.Now(), 5, true, nil, f)
+				obj, err := f.Put(ctx, strings.NewReader("hello"), src)
+				require.NoError(t, err)
+				require.ErrorIs(t, f.Rmdir(ctx, full), fs.ErrorDirectoryNotEmpty)
+				require.NoError(t, obj.Remove(ctx))
+				require.NoError(t, f.Rmdir(ctx, full))
+				fx.mu.Lock()
+				for _, item := range fx.media {
+					assert.NotContains(t, []api.ID{"20", "21", "22"}, item.ID)
+				}
+				fx.mu.Unlock()
+				assert.Zero(t, fx.folderWrites.Load())
+			})
+		}
+	}
+}
+
+func TestFlatProviderAliasesFailClosed(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		size int64
+	}{
+		{flatFixtureName("empty", true) + " (1)", 1},
+		{flatFixtureName("file", false) + " (1)", 0},
+		{flatMappingName(strings.Repeat("long/", 20)) + " (1)", 0},
+		{flatFixtureName("empty", true) + " (0)", 0},
+		{flatFixtureName("empty", true) + " (01)", 0},
+		{flatFixtureName("empty", true) + " (1) (2)", 0},
+		{"rclone-flat-v1-d-85 (1)", 0},
+		{flatFixtureName(strings.Repeat("a", 146), true) + " (10)", 0},
+	} {
+		t.Run(fmt.Sprintf("%s/size=%d", test.name, test.size), func(t *testing.T) {
+			fx := newFlatFixture(t)
+			fx.media = []api.Media{{ID: "20", FolderID: "1", Name: test.name, Size: test.size, Type: "file"}}
+			f, ctx := flatTestFs(t, fx, "", false)
+			_, err := f.List(ctx, "")
+			require.ErrorContains(t, err, "invalid")
+			src := object.NewStaticObjectInfo("unrelated.txt", time.Now(), 1, true, nil, f)
+			_, err = f.Put(ctx, strings.NewReader("x"), src)
+			require.Error(t, err)
+			fx.mu.Lock()
+			assert.Len(t, fx.media, 1)
+			assert.Equal(t, test.name, fx.media[0].Name)
+			fx.mu.Unlock()
+		})
+	}
+}
+
+func TestFlatConcurrentMkdir(t *testing.T) {
+	for _, cached := range []bool{false, true} {
+		t.Run(strconv.FormatBool(cached), func(t *testing.T) {
+			fx := newFlatFixture(t)
+			fx.wrapHandler(func(handler http.Handler) http.Handler {
+				return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path != "/sapi/upload" || r.URL.Query().Get("action") != "save" {
+						handler.ServeHTTP(w, r)
+						return
+					}
+					time.Sleep(30 * time.Millisecond)
+					reply := httptest.NewRecorder()
+					handler.ServeHTTP(reply, r)
+					fx.mu.Lock()
+					counts := map[string]int{}
+					for i := range fx.media {
+						name := fx.media[i].Name
+						if counts[name] > 0 {
+							fx.media[i].Name += fmt.Sprintf(" (%d)", counts[name])
+						}
+						counts[name]++
+					}
+					fx.mu.Unlock()
+					for key, values := range reply.Header() {
+						w.Header()[key] = values
+					}
+					w.WriteHeader(reply.Code)
+					_, _ = w.Write(reply.Body.Bytes())
+				})
+			})
+			f, ctx := flatTestFs(t, fx, "", cached)
+			errs := make(chan error, 8)
+			start := make(chan struct{})
+			for range cap(errs) {
+				go func() {
+					<-start
+					errs <- f.Mkdir(ctx, "upload/upload")
+				}()
+			}
+			close(start)
+			for range cap(errs) {
+				assert.NoError(t, <-errs)
+			}
+			fx.mu.Lock()
+			assert.Len(t, fx.media, 2, "each virtual directory must be created once")
+			fx.mu.Unlock()
+		})
+	}
+}
+
 func TestFlatDefaultViewIsUnchanged(t *testing.T) {
 	fx := newFlatFixture(t)
 	fx.media = []api.Media{{ID: "10", FolderID: "1", Name: flatFixtureName("logical/file.txt", false), Size: 1, Type: "file"}, {ID: "11", FolderID: "1", Name: "ordinary.txt", Size: 2, Type: "file"}}
