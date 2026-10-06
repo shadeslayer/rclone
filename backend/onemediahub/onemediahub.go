@@ -364,6 +364,8 @@ type Fs struct {
 	downloadRefresh  singleflight.Group
 	validation       *batcher.Batcher[validationItem, string]
 	validationCancel context.CancelFunc
+	metadataReads    *batcher.Batcher[metadataItem, api.Media]
+	metadataCancel   context.CancelFunc
 	deletions        *batcher.Batcher[deleteItem, error]
 	deleteMu         sync.Mutex
 	deletePending    int
@@ -490,6 +492,14 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		if err != nil {
 			return nil, err
 		}
+	}
+	metadataCtx, cancelMetadata := context.WithCancel(context.Background())
+	f.metadataCancel = cancelMetadata
+	f.metadataReads, err = batcher.New(ctx, f, func(_ context.Context, items []metadataItem, results []api.Media, itemErrors []error) error {
+		return f.checkUploadMetadata(metadataCtx, items, results, itemErrors)
+	}, batcher.Options{Mode: "sync", Size: pageSize, MaxBatchSize: pageSize, Timeout: 20 * time.Millisecond})
+	if err != nil {
+		return nil, err
 	}
 	deleteMode, deleteSize := "sync", min(opt.DeleteBatchSize, max(1, fs.GetConfig(ctx).Checkers))
 	if opt.AsyncDelete {
@@ -1192,6 +1202,12 @@ func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
 
 // Shutdown finishes deletion batches, stops upload validation and closes the persistent caches.
 func (f *Fs) Shutdown(ctx context.Context) error {
+	if f.metadataCancel != nil {
+		f.metadataCancel()
+	}
+	if f.metadataReads != nil {
+		f.metadataReads.Shutdown()
+	}
 	if f.deletions != nil {
 		f.deletions.Shutdown()
 	}
@@ -3098,9 +3114,10 @@ func (o *Object) waitMetadata(ctx context.Context) error {
 	defer cancel()
 	delay := metadataDelay
 	for {
-		err := o.refresh(ctx)
+		info, err := o.lookupUploadMetadata(ctx)
 		if !errors.Is(err, fs.ErrorObjectNotFound) {
 			if err == nil {
+				o.info = info
 				o.fs.cacheMedia(o.info, false)
 			}
 			return err
@@ -3114,6 +3131,156 @@ func (o *Object) waitMetadata(ctx context.Context) error {
 		}
 		delay = min(2*delay, metadataMaxDelay)
 	}
+}
+
+type metadataItem struct {
+	ctx context.Context
+	id  api.ID
+}
+
+func uploadBatchContext(ctx context.Context, contexts []context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(ctx, metadataTimeout)
+	var active atomic.Int32
+	active.Store(int32(len(contexts)))
+	stops := make([]func() bool, 0, len(contexts))
+	for _, itemCtx := range contexts {
+		stops = append(stops, context.AfterFunc(itemCtx, func() {
+			if active.Add(-1) == 0 {
+				cancel()
+			}
+		}))
+	}
+	return ctx, func() {
+		for _, stop := range stops {
+			stop()
+		}
+		cancel()
+	}
+}
+
+func (f *Fs) checkUploadMetadata(ctx context.Context, items []metadataItem, results []api.Media, itemErrors []error) error {
+	var ids []api.ID
+	var contexts []context.Context
+	for i, item := range items {
+		if itemErrors[i] = item.ctx.Err(); itemErrors[i] == nil {
+			if !slices.Contains(ids, item.id) {
+				ids = append(ids, item.id)
+			}
+			contexts = append(contexts, item.ctx)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	ctx, cancel := uploadBatchContext(ctx, contexts)
+	defer cancel()
+	metadata := make(map[api.ID]api.Media, len(ids))
+	err := f.fetchMedia(ctx, ids, false, func(item api.Media) error {
+		if !slices.Contains(ids, item.ID) {
+			return errors.New("upload metadata lookup returned an unexpected ID")
+		}
+		if _, found := metadata[item.ID]; found {
+			return errors.New("upload metadata lookup returned a duplicate ID")
+		}
+		metadata[item.ID] = item
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for i, item := range items {
+		if itemErrors[i] = item.ctx.Err(); itemErrors[i] != nil {
+			continue
+		}
+		if info, found := metadata[item.id]; found {
+			results[i] = info
+		}
+	}
+	return nil
+}
+
+func (o *Object) lookupUploadMetadata(ctx context.Context) (api.Media, error) {
+	type response struct {
+		info api.Media
+		err  error
+	}
+	result := make(chan response, 1)
+	id := o.info.ID
+	go func() {
+		info, err := o.fs.metadataReads.Commit(ctx, string(id), metadataItem{ctx: ctx, id: id})
+		result <- response{info, err}
+	}()
+	select {
+	case <-ctx.Done():
+		return api.Media{}, ctx.Err()
+	case item := <-result:
+		if item.err == nil && item.info.ID == "" {
+			return api.Media{}, fs.ErrorObjectNotFound
+		}
+		return item.info, item.err
+	}
+}
+
+func (o *Object) useUploadMetadata(reply api.Response, data api.Upload) bool {
+	var status, etag string
+	if len(reply.Status) != 0 && json.Unmarshal(reply.Status, &status) != nil || len(reply.ETag) != 0 && json.Unmarshal(reply.ETag, &etag) != nil {
+		return false
+	}
+	var sources map[string][]json.RawMessage
+	if json.Unmarshal(reply.Metadata, &sources) != nil || len(sources["files"]) != 1 {
+		return false
+	}
+	for _, source := range []string{"pictures", "videos", "audios"} {
+		if len(sources[source]) != 0 {
+			return false
+		}
+	}
+	raw := sources["files"][0]
+	var fields map[string]json.RawMessage
+	var item api.Media
+	if json.Unmarshal(raw, &fields) != nil || json.Unmarshal(raw, &item) != nil {
+		return false
+	}
+	for _, field := range []string{"id", "name", "size", "modificationdate", "url"} {
+		if len(fields[field]) == 0 || bytes.Equal(fields[field], []byte("null")) {
+			return false
+		}
+	}
+	if len(fields["folderid"]) == 0 && len(fields["folder"]) == 0 {
+		return false
+	}
+	if item.FolderID == "" {
+		item.FolderID = item.Folder
+	}
+	if item.Folder != "" && !sameParent(item.Folder, string(item.FolderID)) {
+		return false
+	}
+	if item.Status == "" {
+		item.Status = status
+	}
+	if item.Status != "V" || status != "" && status != item.Status {
+		return false
+	}
+	if item.ETag == "" {
+		item.ETag = etag
+	}
+	if etag != "" && etag != item.ETag {
+		return false
+	}
+	if item.Type == "" {
+		item.Type = "file"
+	}
+	if item.Type != "file" {
+		return false
+	}
+	modified, err := time.Parse(dateFormat, data.Modified)
+	nameMatches := item.Name == data.Name || o.flatDirectory && item.Size == 0 && o.fs.mediaKey(item).name == o.fs.opt.Enc.ToStandardName(data.Name)
+	if err != nil || item.ID != o.info.ID || !nameMatches || !sameParent(item.FolderID, string(data.FolderID)) || item.Size != data.Size || item.Modified != modified.UnixMilli() || item.URL == "" || item.IsDeleted() {
+		return false
+	}
+	o.info = item
+	o.fs.cacheMedia(item, false)
+	return true
 }
 
 // Open downloads original content and supports range requests.
@@ -3383,7 +3550,13 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if reply.ID == "" {
 		return errors.New("upload returned no media ID")
 	}
+	if data.ID != "" && string(reply.ID) != data.ID {
+		return errors.New("upload returned an unexpected replacement media ID")
+	}
 	o.info.ID = reply.ID
+	if o.useUploadMetadata(reply, data) {
+		return nil
+	}
 	return o.waitMetadata(ctx)
 }
 
@@ -3999,11 +4172,13 @@ func (o *Object) uploadAsync(ctx context.Context, in io.Reader, data api.Upload,
 	if reply.ID != "" && reply.ID != o.info.ID {
 		return fmt.Errorf("upload returned media ID %s, expected %s", reply.ID, o.info.ID)
 	}
-	if err := o.waitUpload(ctx, data.FolderID); err != nil {
-		return err
-	}
-	if err := o.waitMetadata(ctx); err != nil {
-		return err
+	if !o.useUploadMetadata(reply, data) {
+		if err := o.waitUpload(ctx, data.FolderID); err != nil {
+			return err
+		}
+		if err := o.waitMetadata(ctx); err != nil {
+			return err
+		}
 	}
 	return o.completeUploadRecovery(recovery, data)
 }

@@ -61,6 +61,9 @@ type Response struct {
 	Error       *Error          `json:"error"`       // Error contains a failure, if any.
 	ID          ID              `json:"id"`          // ID identifies a saved item or folder.
 	More        bool            `json:"more"`        // More indicates another media page.
+	Metadata    json.RawMessage `json:"metadata"`    // Metadata contains optional source-specific upload metadata.
+	Status      json.RawMessage `json:"status"`      // Status contains the optional upload processing status.
+	ETag        json.RawMessage `json:"etag"`        // ETag contains an optional opaque server content version.
 }
 
 // Session contains the credentials for a SAPI session.
