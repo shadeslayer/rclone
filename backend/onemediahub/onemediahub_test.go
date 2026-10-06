@@ -27,6 +27,7 @@ import (
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/obscure"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fstest/fstests"
 	"github.com/rclone/rclone/lib/kv"
@@ -2498,6 +2499,198 @@ func TestUploadDiscovery(t *testing.T) {
 	_, err = f.Put(ctx, strings.NewReader("x"), src)
 	require.NoError(t, err)
 	assert.True(t, uploaded)
+}
+
+const cloudFrontBlockedBody = `<HTML><HEAD><TITLE>ERROR: The request could not be satisfied</TITLE></HEAD><BODY><H1>403 ERROR</H1>Request blocked.</BODY></HTML>`
+
+func cloudFrontBlockedReply(t *testing.T, w http.ResponseWriter) {
+	t.Helper()
+	w.Header().Set("Server", "CloudFront")
+	w.Header().Set("Content-Type", "text/html")
+	w.Header().Set("X-Cache", "Error from cloudfront")
+	w.WriteHeader(http.StatusForbidden)
+	_, err := io.WriteString(w, cloudFrontBlockedBody)
+	assert.NoError(t, err)
+}
+
+func TestServerInfoRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		status       int
+		blocked      bool
+		persistent   bool
+		explicitURL  bool
+		wantError    bool
+		wantRequests int32
+	}{
+		{name: "CloudFront block", blocked: true, wantRequests: 2},
+		{name: "server unavailable", status: http.StatusServiceUnavailable, wantRequests: 2},
+		{name: "permission denied", status: http.StatusForbidden, wantError: true, wantRequests: 1},
+		{name: "bounded block retries", blocked: true, persistent: true, wantError: true, wantRequests: 2},
+		{name: "explicit upload server", blocked: true, persistent: true, explicitURL: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newFixture(t)
+			var requests atomic.Int32
+			fx.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/sapi/system/information" && (requests.Add(1) == 1 || tc.persistent) {
+					if tc.blocked {
+						cloudFrontBlockedReply(t, w)
+					} else {
+						http.Error(w, "denied", tc.status)
+					}
+					return
+				}
+				fx.serve(t, w, r)
+			})
+			ctx, ci := fs.AddConfig(context.Background())
+			ci.LowLevelRetries = 2
+			m := fx.config(t)
+			if tc.explicitURL {
+				m["upload_url"] = fx.server.URL
+			}
+			remote, err := NewFs(ctx, "test", "", m)
+			if tc.wantError {
+				require.ErrorContains(t, err, "read OneMediaHub server information")
+			} else {
+				require.NoError(t, err)
+				require.NoError(t, remote.(*Fs).Shutdown(ctx))
+			}
+			assert.Equal(t, tc.wantRequests, requests.Load())
+		})
+	}
+}
+
+func TestCloudFrontRetryClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name, server, contentType, body string
+		status                          int
+		wantRetry                       bool
+	}{
+		{name: "blocked", status: 403, server: "CloudFront", contentType: "text/html", body: cloudFrontBlockedBody, wantRetry: true},
+		{name: "charset", status: 403, server: "CloudFront", contentType: "text/html; charset=UTF-8", body: cloudFrontBlockedBody, wantRetry: true},
+		{name: "other server", status: 403, contentType: "text/html", body: cloudFrontBlockedBody},
+		{name: "other content type", status: 403, server: "CloudFront", contentType: "text/plain", body: cloudFrontBlockedBody},
+		{name: "other denial", status: 403, server: "CloudFront", contentType: "text/html", body: "<HTML>Access denied: secret</HTML>"},
+		{name: "other CloudFront error", status: 403, server: "CloudFront", contentType: "text/html", body: strings.ReplaceAll(cloudFrontBlockedBody, "Request blocked.", "Bad request.")},
+		{name: "API permission", status: 403, server: "CloudFront", contentType: "application/json", body: `{"error":{"code":"PRO-1115","message":"InvalidPassword"}}`},
+		{name: "other status", status: 404, server: "CloudFront", contentType: "text/html", body: cloudFrontBlockedBody},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := &http.Response{StatusCode: tc.status, Status: fmt.Sprintf("%d %s", tc.status, http.StatusText(tc.status)), Header: http.Header{}, Body: io.NopCloser(strings.NewReader(tc.body))}
+			resp.Header.Set("Server", tc.server)
+			resp.Header.Set("Content-Type", tc.contentType)
+			err := errorHandler(resp)
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), "secret")
+			wantRetry, err := retry(context.Background(), resp, err)
+			assert.Equal(t, tc.wantRetry, wantRetry)
+		})
+	}
+}
+
+func TestCloudFrontReadAndDelete(t *testing.T) {
+	for _, action := range []string{"get", "delete"} {
+		t.Run(action, func(t *testing.T) {
+			fx := newFixture(t)
+			ctx, ci := fs.AddConfig(context.Background())
+			ci.LowLevelRetries = 2
+			remote, err := NewFs(ctx, "test", "", fx.config(t))
+			require.NoError(t, err)
+			f := remote.(*Fs)
+			t.Cleanup(func() { require.NoError(t, f.Shutdown(ctx)) })
+			var requests atomic.Int32
+			fx.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if requests.Add(1) == 1 {
+					cloudFrontBlockedReply(t, w)
+					return
+				}
+				jsonReply(t, w, map[string]any{"data": map[string]any{}})
+			})
+			_, err = f.request(ctx, http.MethodPost, "/media/file", action, nil, map[string]any{"files": []api.ID{"1"}})
+			if action == "get" {
+				require.NoError(t, err)
+				assert.EqualValues(t, 2, requests.Load())
+			} else {
+				require.Error(t, err)
+				assert.False(t, fserrors.IsRetryError(err))
+				assert.EqualValues(t, 1, requests.Load())
+			}
+		})
+	}
+}
+
+func TestCloudFrontCooldownCancellation(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var requests atomic.Int32
+	started := make(chan struct{})
+	fx.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		first := requests.Add(1) == 1
+		cloudFrontBlockedReply(t, w)
+		if first {
+			close(started)
+		}
+	})
+	done := make(chan error, 1)
+	m := fx.config(t)
+	go func() {
+		_, err := NewFs(ctx, "test", "", m)
+		done <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("discovery request did not start")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("cooldown ended before cancellation: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	assert.EqualValues(t, 1, requests.Load())
+	cancel()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("cooldown did not stop after cancellation")
+	}
+}
+
+func TestCloudFrontLoginRecovery(t *testing.T) {
+	for _, blocked := range []bool{true, false} {
+		t.Run(strconv.FormatBool(blocked), func(t *testing.T) {
+			fx := newFixture(t)
+			var requests atomic.Int32
+			fx.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/sapi/login" && requests.Add(1) == 1 {
+					if blocked {
+						cloudFrontBlockedReply(t, w)
+					} else {
+						w.WriteHeader(http.StatusForbidden)
+						jsonReply(t, w, map[string]any{"error": map[string]string{"code": "PRO-1115", "message": "InvalidPassword"}})
+					}
+					return
+				}
+				fx.serve(t, w, r)
+			})
+			ctx, ci := fs.AddConfig(context.Background())
+			ci.LowLevelRetries = 2
+			m := fx.config(t)
+			m["upload_url"] = fx.server.URL
+			remote, err := NewFs(ctx, "test", "", m)
+			if blocked {
+				require.NoError(t, err)
+				assert.EqualValues(t, 2, requests.Load())
+				require.NoError(t, remote.(*Fs).Shutdown(ctx))
+			} else {
+				require.ErrorContains(t, err, "PRO-1115")
+				assert.EqualValues(t, 1, requests.Load())
+			}
+		})
+	}
 }
 
 func TestAPIErrors(t *testing.T) {

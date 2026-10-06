@@ -67,6 +67,7 @@ const (
 	metadataDelay        = 200 * time.Millisecond
 	metadataMaxDelay     = 2 * time.Second
 	maxErrorSize         = 64 * 1024
+	cloudFrontBlockDelay = 30 * time.Second
 	sessionCookie        = "JSESSIONID"
 	metadataVersion      = 2
 	uploadJournalVersion = 1
@@ -419,12 +420,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			_ = f.Shutdown(ctx)
 		}
 	}()
-	info, err := serverInfo(ctx, srv)
-	if err != nil {
-		return nil, err
-	}
 	uploadURL := opt.UploadURL
 	if uploadURL == "" {
+		info, err := f.serverInfo(ctx)
+		if err != nil {
+			return nil, err
+		}
 		uploadURL = info.UploadURL
 	}
 
@@ -440,7 +441,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return nil, errors.New("upload server must use HTTPS")
 	}
 	f.uploadURL = strings.TrimRight(upload.String(), "/") + "/" + strings.Trim(opt.APIPath, "/")
-	if _, err = f.auth.prepare(ctx); err != nil {
+	err = f.callRead(ctx, func() (bool, error) {
+		_, err := f.auth.prepare(ctx)
+		return errors.Is(err, errCloudFrontBlocked), err
+	})
+	if err != nil {
 		return nil, err
 	}
 	if opt.ResumeUploads {
@@ -516,9 +521,12 @@ func (f *Fs) Hashes() hash.Set { return hash.Set(hash.None) }
 // Features returns the optional backend operations.
 func (f *Fs) Features() *fs.Features { return f.features }
 
-func serverInfo(ctx context.Context, srv *rest.Client) (*api.ServerInfo, error) {
+func (f *Fs) serverInfo(ctx context.Context) (*api.ServerInfo, error) {
 	var info api.ServerInfo
-	_, err := srv.CallJSON(ctx, &rest.Opts{Method: http.MethodGet, Path: "/system/information", Parameters: url.Values{"action": {"get"}}, NoRedirect: true}, nil, &info)
+	err := f.callRead(ctx, func() (bool, error) {
+		resp, err := f.srv.CallJSON(ctx, &rest.Opts{Method: http.MethodGet, Path: "/system/information", Parameters: url.Values{"action": {"get"}}, NoRedirect: true}, nil, &info)
+		return retry(ctx, resp, err)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("read OneMediaHub server information: %w", err)
 	}
@@ -529,30 +537,73 @@ func serverInfo(ctx context.Context, srv *rest.Client) (*api.ServerInfo, error) 
 	return &info, nil
 }
 
+var errCloudFrontBlocked = errors.New("request blocked by CloudFront")
+
 func errorHandler(resp *http.Response) error {
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorSize))
+	_ = resp.Body.Close()
 	var reply api.Response
-	if err := rest.DecodeJSON(resp, &reply); err == nil && reply.Error != nil {
+	if readErr == nil && json.Unmarshal(body, &reply) == nil && reply.Error != nil {
 		return reply.Error
 	}
+	var err error
 	if req := resp.Request; req != nil && req.URL != nil {
-		return fmt.Errorf("OneMediaHub HTTP error: %s (%s %s%s action=%q)", resp.Status, req.Method, req.URL.Host, req.URL.EscapedPath(), req.URL.Query().Get("action"))
+		err = fmt.Errorf("OneMediaHub HTTP error: %s (%s %s%s action=%q)", resp.Status, req.Method, req.URL.Host, req.URL.EscapedPath(), req.URL.Query().Get("action"))
+	} else {
+		err = fmt.Errorf("OneMediaHub HTTP error: %s", resp.Status)
 	}
-	return fmt.Errorf("OneMediaHub HTTP error: %s", resp.Status)
+	contentType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	// O2's temporary edge blocks use this page rather than a SAPI error.
+	if readErr == nil && resp.StatusCode == http.StatusForbidden && strings.EqualFold(resp.Header.Get("Server"), "CloudFront") && contentType == "text/html" &&
+		bytes.Contains(body, []byte("ERROR: The request could not be satisfied")) && bytes.Contains(body, []byte("Request blocked.")) {
+		return fmt.Errorf("%w: %v", errCloudFrontBlocked, err)
+	}
+	return err
 }
 
 func retry(ctx context.Context, resp *http.Response, err error) (bool, error) {
 	if fserrors.ContextError(ctx, &err) {
 		return false, err
 	}
+	if errors.Is(err, errCloudFrontBlocked) {
+		return true, err
+	}
 	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, []int{http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout}), err
+}
+
+func (f *Fs) callRead(ctx context.Context, run pacer.Paced) error {
+	var blockedUntil time.Time
+	return f.pacer.Call(func() (bool, error) {
+		// Long edge-block cooldowns must be interruptible by cancellation.
+		if delay := time.Until(blockedUntil); delay > 0 {
+			fs.Debugf(f, "CloudFront blocked the request; waiting %v before retrying", delay)
+			timer := time.NewTimer(delay)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return false, ctx.Err()
+			case <-timer.C:
+			}
+		}
+		retry, err := run()
+		if retry && errors.Is(err, errCloudFrontBlocked) {
+			blockedUntil = time.Now().Add(cloudFrontBlockDelay)
+		}
+		return retry, err
+	})
 }
 
 // call checks JSON errors even on HTTP success and renews expired sessions once.
 func (f *Fs) call(ctx context.Context, opts rest.Opts, request any) (reply api.Response, err error) {
+	action := opts.Parameters.Get("action")
+	readOnly := opts.Body == nil && (action == "get" || action == "get-storage-space")
 	run := func() (bool, error) {
 		for attempt := 0; attempt < maxAuthAttempts; attempt++ {
 			state, err := f.auth.prepare(ctx)
 			if err != nil {
+				if readOnly && errors.Is(err, errCloudFrontBlocked) {
+					return retry(ctx, nil, err)
+				}
 				return false, err
 			}
 			respReply, resp, err := f.send(ctx, opts, request, state)
@@ -565,14 +616,16 @@ func (f *Fs) call(ctx context.Context, opts rest.Opts, request any) (reply api.R
 					continue
 				}
 			}
+			if errors.Is(err, errCloudFrontBlocked) && !readOnly {
+				return false, err
+			}
 			return retry(ctx, resp, err)
 		}
 		return false, errors.New("session renewal failed")
 	}
 	// Only read operations may be replayed after ambiguous network failures.
-	action := opts.Parameters.Get("action")
-	if opts.Body == nil && (action == "get" || action == "get-storage-space") {
-		err = f.pacer.Call(run)
+	if readOnly {
+		err = f.callRead(ctx, run)
 	} else {
 		err = f.pacer.CallNoRetry(run)
 	}
