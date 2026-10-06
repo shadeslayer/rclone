@@ -564,11 +564,12 @@ func pageParams(offset int) url.Values {
 }
 
 type metadataSnapshot struct {
-	Version int                  // Version identifies the cache format.
-	Anchor  int64                // Anchor is the last applied server response time in milliseconds.
-	Folders []api.Folder         // Folders contains account folders.
-	Media   map[api.ID]api.Media // Media indexes account files by ID.
-	Pending []api.ID             // Pending identifies locked or unavailable media to fetch again.
+	Version        int                  // Version identifies the cache format.
+	Anchor         int64                // Anchor is the last applied server response time in milliseconds.
+	Folders        []api.Folder         // Folders contains account folders.
+	Media          map[api.ID]api.Media // Media indexes account files by ID.
+	Pending        []api.ID             // Pending identifies locked or unavailable media to fetch again.
+	PendingFolders []api.ID             // PendingFolders identifies unavailable or locked folders to fetch again.
 }
 
 type metadataCache struct {
@@ -769,18 +770,58 @@ func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
 	if c.state != nil {
 		*next = *c.state
 		next.Media = maps.Clone(c.state.Media)
+		next.Folders = slices.Clone(c.state.Folders)
 	}
 	changes, timestamp, err := f.changes(ctx, next.Anchor)
 	if err != nil {
 		return false, err
 	}
 	folderChanges := changes["folder"]
-	foldersChanged := c.state == nil || len(folderChanges.New)+len(folderChanges.Updated)+len(folderChanges.Deleted)+len(folderChanges.Locked) > 0
-	if foldersChanged {
-		next.Folders, err = f.fetchFolders(ctx)
+	foldersChanged := c.state == nil || len(next.PendingFolders)+len(folderChanges.New)+len(folderChanges.Updated)+len(folderChanges.Deleted)+len(folderChanges.Locked) > 0
+	if c.state == nil {
+		next.Folders, err = f.fetchFolders(ctx, nil)
 		if err != nil {
 			return false, err
 		}
+	}
+	if foldersChanged {
+		ids := map[api.ID]struct{}{}
+		for _, id := range slices.Concat(next.PendingFolders, folderChanges.New, folderChanges.Updated, folderChanges.Locked) {
+			ids[id] = struct{}{}
+		}
+		for _, id := range folderChanges.Deleted {
+			delete(ids, id)
+			next.Folders = slices.DeleteFunc(next.Folders, func(folder api.Folder) bool { return folder.ID == id })
+		}
+		if c.state == nil {
+			for _, folder := range next.Folders {
+				delete(ids, folder.ID)
+			}
+		}
+		for batch := range slices.Chunk(slices.Sorted(maps.Keys(ids)), pageSize) {
+			folders, err := f.fetchFolders(ctx, batch)
+			if err != nil {
+				return false, err
+			}
+			for _, folder := range folders {
+				next.Folders = slices.DeleteFunc(next.Folders, func(old api.Folder) bool { return old.ID == folder.ID })
+				if !folder.SoftDeleted && folder.Status != statusDeleted {
+					next.Folders = append(next.Folders, folder)
+				}
+				if folder.Status != "L" && !slices.Contains(folderChanges.Locked, folder.ID) {
+					delete(ids, folder.ID)
+				}
+			}
+		}
+		for _, folder := range next.Folders {
+			if folder.Status == "L" || slices.Contains(folderChanges.Locked, folder.ID) {
+				ids[folder.ID] = struct{}{}
+			}
+			if folder.ParentID != "" && folder.ParentID != "0" && !slices.Contains(folderChanges.Deleted, folder.ParentID) && !slices.ContainsFunc(next.Folders, func(parent api.Folder) bool { return parent.ID == folder.ParentID }) {
+				ids[folder.ParentID] = struct{}{}
+			}
+		}
+		next.PendingFolders = slices.Sorted(maps.Keys(ids))
 	}
 	ids := map[api.ID]struct{}{}
 	locked := map[api.ID]struct{}{}
@@ -858,14 +899,19 @@ func (f *Fs) folders(ctx context.Context) ([]api.Folder, error) {
 		defer c.mu.Unlock()
 		return slices.Clone(c.state.Folders), nil
 	}
-	return f.fetchFolders(ctx)
+	return f.fetchFolders(ctx, nil)
 }
 
-func (f *Fs) fetchFolders(ctx context.Context) ([]api.Folder, error) {
+func (f *Fs) fetchFolders(ctx context.Context, ids []api.ID) ([]api.Folder, error) {
 	var folders []api.Folder
 	seen := map[api.ID]struct{}{}
 	for offset := 0; ; {
-		reply, err := f.request(ctx, http.MethodGet, "/media/folder", "get", pageParams(offset), nil)
+		method, params := http.MethodGet, pageParams(offset)
+		var request any
+		if ids != nil {
+			method, params, request = http.MethodPost, nil, map[string]any{"ids": ids}
+		}
+		reply, err := f.request(ctx, method, "/media/folder", "get", params, request)
 		if err != nil {
 			return nil, err
 		}
@@ -876,15 +922,21 @@ func (f *Fs) fetchFolders(ctx context.Context) ([]api.Folder, error) {
 		if err := json.Unmarshal(reply.Data, &data); err != nil {
 			return nil, err
 		}
+		if ids != nil && reply.More {
+			return nil, errors.New("folder ID lookup returned an incomplete result")
+		}
 		// Some servers repeat the root folder on the last page.
 		for _, folder := range data.Folders {
+			if ids != nil && !slices.Contains(ids, folder.ID) {
+				return nil, errors.New("folder ID lookup returned an unexpected ID")
+			}
 			if _, ok := seen[folder.ID]; ok {
 				continue
 			}
 			seen[folder.ID] = struct{}{}
 			folders = append(folders, folder)
 		}
-		if len(data.Folders) < pageSize {
+		if ids != nil || len(data.Folders) < pageSize {
 			return folders, nil
 		}
 		offset += len(data.Folders)

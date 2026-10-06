@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -215,6 +216,72 @@ func TestMetadataCacheDeletedRoot(t *testing.T) {
 	f.metadata.mu.Unlock()
 	_, err = f.NewObject(ctx, "file")
 	assert.ErrorIs(t, err, fs.ErrorObjectNotFound)
+}
+
+func TestMetadataCacheFolderDeltas(t *testing.T) {
+	cacheDir := config.GetCacheDir()
+	require.NoError(t, config.SetCacheDir(t.TempDir()))
+	t.Cleanup(func() { require.NoError(t, config.SetCacheDir(cacheDir)) })
+	ctx := context.Background()
+	fx := newFixture(t)
+	fx.requestTime = 1700000000123
+	fx.folders = []api.Folder{{ID: "1", Name: "old"}, {ID: "2", ParentID: "1", Name: "child"}, {ID: "3", Name: "deleted"}}
+	fx.changes = map[string]api.Changes{}
+	m := fx.config(t)
+	m["metadata_cache"] = "true"
+	remote, err := NewFs(ctx, "folder-deltas", "", m)
+	require.NoError(t, err)
+	f := remote.(*Fs)
+	t.Cleanup(func() { require.NoError(t, f.Shutdown(ctx)) })
+	_, err = f.List(ctx, "old/child")
+	require.NoError(t, err)
+	fx.mu.Lock()
+	fx.folders[0].Name = "renamed"
+	fx.folders = fx.folders[:2]
+	fx.changes = map[string]api.Changes{"folder": {Updated: []api.ID{"1"}, New: []api.ID{"4"}, Deleted: []api.ID{"3"}}}
+	fx.requestTime += 1000
+	fx.mu.Unlock()
+	f.expireMetadata()
+	_, err = f.List(ctx, "renamed/child")
+	require.NoError(t, err)
+	assert.Equal(t, [][]api.ID{{"1", "4"}}, fx.folderBatches)
+	_, err = f.List(ctx, "old/child")
+	assert.ErrorIs(t, err, fs.ErrorDirNotFound)
+	_, err = f.List(ctx, "deleted")
+	assert.ErrorIs(t, err, fs.ErrorDirNotFound)
+	fx.mu.Lock()
+	fx.changes = map[string]api.Changes{}
+	fx.folders = append(fx.folders, api.Folder{ID: "4", Name: "late"})
+	fx.failFolders = true
+	fx.mu.Unlock()
+	f.expireMetadata()
+	anchor := f.metadata.state.Anchor
+	_, err = f.List(ctx, "late")
+	require.ErrorContains(t, err, "failed folders")
+	assert.Equal(t, anchor, f.metadata.state.Anchor)
+	fx.mu.Lock()
+	fx.failFolders = false
+	fx.mu.Unlock()
+	_, err = f.List(ctx, "late")
+	require.NoError(t, err)
+	assert.Equal(t, [][]api.ID{{"1", "4"}, {"4"}}, fx.folderBatches)
+
+	// A child can arrive before its parent is visible in the changes feed.
+	fx.mu.Lock()
+	fx.folders = append(fx.folders, api.Folder{ID: "5", ParentID: "6", Name: "child"})
+	fx.changes = map[string]api.Changes{"folder": {New: []api.ID{"5"}}}
+	fx.mu.Unlock()
+	f.expireMetadata()
+	require.NoError(t, f.syncMetadata(ctx))
+	assert.Equal(t, []api.ID{"6"}, f.metadata.state.PendingFolders)
+	fx.mu.Lock()
+	fx.folders = append(fx.folders, api.Folder{ID: "6", Name: "parent"})
+	fx.changes = map[string]api.Changes{}
+	fx.mu.Unlock()
+	f.expireMetadata()
+	_, err = f.List(ctx, "parent/child")
+	require.NoError(t, err)
+	assert.Empty(t, f.metadata.state.PendingFolders)
 }
 
 func TestMetadataCachePendingAndBatching(t *testing.T) {
@@ -565,22 +632,24 @@ const (
 
 // fixture models SAPI 14.5, with separately enabled O2 compatibility behavior.
 type fixture struct {
-	mu           sync.Mutex
-	mode         fixtureMode
-	pendingReads int
-	folders      []api.Folder
-	media        []api.Media
-	content      map[api.ID]string
-	nextID       int
-	server       *httptest.Server
-	changes      map[string]api.Changes
-	requestTime  int64
-	requests     map[string]int
-	failMedia    bool
-	changesFrom  []string
-	mediaBatches []int
-	accountID    string
-	changeData   any
+	mu            sync.Mutex
+	mode          fixtureMode
+	pendingReads  int
+	folders       []api.Folder
+	media         []api.Media
+	content       map[api.ID]string
+	nextID        int
+	server        *httptest.Server
+	changes       map[string]api.Changes
+	requestTime   int64
+	requests      map[string]int
+	failMedia     bool
+	changesFrom   []string
+	mediaBatches  []int
+	folderBatches [][]api.ID
+	failFolders   bool
+	accountID     string
+	changeData    any
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -652,6 +721,26 @@ func (fx *fixture) serve(t *testing.T, w http.ResponseWriter, r *http.Request) {
 		}
 		jsonReply(t, w, map[string]any{"data": data, "requesttime": strconv.FormatInt(fx.requestTime, 10)})
 	case r.URL.Path == "/sapi/media/folder" && action == "get":
+		if fx.failFolders {
+			jsonReply(t, w, map[string]any{"error": map[string]string{"code": "COM-1011", "message": "failed folders"}})
+			return
+		}
+		if r.Method == http.MethodPost {
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&envelope))
+			var data struct {
+				IDs []api.ID `json:"ids"`
+			}
+			require.NoError(t, json.Unmarshal(envelope.Data, &data))
+			fx.folderBatches = append(fx.folderBatches, data.IDs)
+			var folders []api.Folder
+			for _, folder := range fx.folders {
+				if slices.Contains(data.IDs, folder.ID) {
+					folders = append(folders, folder)
+				}
+			}
+			jsonReply(t, w, map[string]any{"data": map[string]any{"folders": folders}})
+			return
+		}
 		assert.Equal(t, http.MethodGet, r.Method)
 		offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
