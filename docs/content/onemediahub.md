@@ -105,7 +105,10 @@ a batch, rclone retries its members individually to identify failing files
 and delete the others. A file confirmed as already in the trash counts as
 deleted. Other failures, including network, quota and permission errors,
 are returned without retrying the batch. Folder deletion continues to
-require an empty folder.
+require an empty folder. After an ambiguous folder-delete response, rclone
+checks the changes API and reports success only when that folder has an
+explicit deletion or trash record without conflicting live changes. This
+check also works without metadata caching.
 
 Enable `--onemediahub-async-delete` to queue deletions and submit batches in
 the background. Async batches use `delete_batch_size` directly, up to 1,000

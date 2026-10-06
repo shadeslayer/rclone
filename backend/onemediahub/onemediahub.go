@@ -2624,15 +2624,39 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		}
 	}
 
-	if id == "" {
+	if id == "" || id == "0" {
 		return nil
 	}
+	var anchor int64
+	if c := f.metadata; c != nil {
+		c.mu.Lock()
+		anchor = c.state.Anchor
+		c.mu.Unlock()
+	}
 	_, err = f.request(ctx, http.MethodPost, "/media/folder", "delete", nil, map[string]any{"folders": []api.ID{api.ID(id)}})
+	if err != nil {
+		f.expireMetadata()
+		var apiErr *api.Error
+		uncertain := fserrors.IsRetryError(err) || fserrors.ShouldRetry(err)
+		if errors.As(err, &apiErr) {
+			uncertain = apiErr.Code == "FOL-1000"
+		}
+		if uncertain {
+			// An ambiguous response can follow removal of the folder on the server.
+			checkCtx, cancel := context.WithTimeout(ctx, metadataTimeout)
+			changes, _, checkErr := f.changes(checkCtx, anchor)
+			cancel()
+			change := changes["folder"]
+			if checkErr == nil && slices.Contains(change.Deleted, api.ID(id)) && !slices.Contains(slices.Concat(change.New, change.Updated, change.Locked), api.ID(id)) {
+				err = nil
+			} else if checkErr != nil {
+				fs.Debugf(f, "Could not confirm folder deletion using changes: %v", checkErr)
+			}
+		}
+	}
 	if err == nil {
 		f.cacheFolder(api.Folder{ID: api.ID(id)}, true)
 		f.dirCache.FlushDir(dir)
-	} else {
-		f.expireMetadata()
 	}
 	return err
 }

@@ -1,12 +1,17 @@
 package onemediahub
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,10 +20,217 @@ import (
 	"github.com/rclone/rclone/backend/onemediahub/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
+	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestRmdirAmbiguousDeletion(t *testing.T) {
+	cacheDir := config.GetCacheDir()
+	require.NoError(t, config.SetCacheDir(t.TempDir()))
+	t.Cleanup(func() { require.NoError(t, config.SetCacheDir(cacheDir)) })
+	for _, cached := range []bool{false, true} {
+		for _, root := range []string{"", "parent"} {
+			for _, test := range []struct {
+				name       string
+				changes    map[string]api.Changes
+				apply      bool
+				wantOK     bool
+				status     int
+				code       string
+				feedError  bool
+				incomplete bool
+			}{
+				{name: "deleted", apply: true, wantOK: true, changes: map[string]api.Changes{"folder": {Deleted: []api.ID{"10"}}}},
+				{name: "trashed", apply: true, wantOK: true, changes: map[string]api.Changes{"folder": {Deleted: []api.ID{"10"}}}},
+				{name: "transport", apply: true, wantOK: true, status: http.StatusServiceUnavailable, changes: map[string]api.Changes{"folder": {Deleted: []api.ID{"10"}}}},
+				{name: "still exists", changes: map[string]api.Changes{}},
+				{name: "conflicting changes", changes: map[string]api.Changes{"folder": {Deleted: []api.ID{"10"}, Updated: []api.ID{"10"}}}},
+				{name: "other source", changes: map[string]api.Changes{"file": {Deleted: []api.ID{"10"}}}},
+				{name: "denied", code: "FOL-1023", changes: map[string]api.Changes{"folder": {Deleted: []api.ID{"10"}}}},
+				{name: "failed feed", apply: true, feedError: true, changes: map[string]api.Changes{"folder": {Deleted: []api.ID{"10"}}}},
+				{name: "incomplete feed", apply: true, incomplete: true, changes: map[string]api.Changes{"folder": {Deleted: []api.ID{"10"}}}},
+			} {
+				t.Run(fmt.Sprintf("cache=%v/root=%q/%s", cached, root, test.name), func(t *testing.T) {
+					ctx := context.Background()
+					fx := newFixture(t)
+					fx.folders = []api.Folder{{ID: "10", Name: "parent", Status: "U"}}
+					fx.changes = map[string]api.Changes{"folder": {New: []api.ID{"10"}}}
+					fx.requestTime = 1700000000000
+					var deletes, confirmations atomic.Int32
+					code := test.code
+					if code == "" {
+						code = "FOL-1000"
+					}
+					srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						if r.URL.Path == "/sapi/media/folder" && r.URL.Query().Get("action") == "delete" {
+							body, err := io.ReadAll(r.Body)
+							assert.NoError(t, err)
+							var request struct {
+								Data struct {
+									Folders []api.ID `json:"folders"`
+								} `json:"data"`
+							}
+							assert.NoError(t, json.Unmarshal(body, &request))
+							assert.Equal(t, []api.ID{"10"}, request.Data.Folders)
+							if test.apply {
+								r.Body = io.NopCloser(bytes.NewReader(body))
+								fx.serve(t, httptest.NewRecorder(), r)
+							}
+							fx.mu.Lock()
+							fx.changes, fx.requestTime = test.changes, 1700000001000
+							fx.mu.Unlock()
+							deletes.Add(1)
+							if test.status != 0 {
+								w.WriteHeader(test.status)
+							} else {
+								jsonReply(t, w, map[string]any{"error": &api.Error{Code: code, Message: "folder error"}})
+							}
+							return
+						}
+						if r.URL.Path == "/sapi/profile/changes" && deletes.Load() != 0 {
+							confirmations.Add(1)
+							if test.feedError {
+								jsonReply(t, w, map[string]any{"error": &api.Error{Code: "COM-1011", Message: "failed changes"}})
+								return
+							}
+							if test.incomplete || test.name == "trashed" {
+								jsonReply(t, w, map[string]any{"data": map[string]any{"folder": map[string]any{"S": []api.ID{"10"}}}, "more": test.incomplete, "requesttime": "1700000001000"})
+								return
+							}
+						}
+						fx.serve(t, w, r)
+					}))
+					defer srv.Close()
+					m := fx.config(t)
+					m["url"], m["metadata_cache"] = srv.URL, fmt.Sprint(cached)
+					r, err := NewFs(ctx, "rmdir-test", root, m)
+					require.NoError(t, err)
+					f := r.(*Fs)
+					t.Cleanup(func() { require.NoError(t, f.Shutdown(ctx)) })
+					dir := "parent"
+					if root != "" {
+						dir = ""
+					}
+					err = f.Rmdir(ctx, dir)
+					if test.wantOK {
+						require.NoError(t, err)
+					} else if test.status != 0 {
+						require.ErrorContains(t, err, http.StatusText(test.status))
+					} else {
+						var apiErr *api.Error
+						require.ErrorAs(t, err, &apiErr)
+						assert.Equal(t, code, apiErr.Code)
+					}
+					assert.EqualValues(t, 1, deletes.Load())
+					wantConfirmations := 1
+					if test.code != "" {
+						wantConfirmations = 0
+					}
+					assert.EqualValues(t, wantConfirmations, confirmations.Load())
+					if cached {
+						assert.EqualValues(t, 1700000000000, f.metadata.state.Anchor)
+					}
+					if test.wantOK {
+						assert.ErrorIs(t, f.Rmdir(ctx, dir), fs.ErrorDirNotFound)
+						assert.EqualValues(t, 1, deletes.Load())
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestRmdirAccountRoot(t *testing.T) {
+	for _, id := range []string{"", "0"} {
+		t.Run(id, func(t *testing.T) {
+			fx := newFixture(t)
+			if id != "" {
+				fx.folders = []api.Folder{{ID: api.ID(id), Name: "root", Status: "U"}}
+			}
+			m := fx.config(t)
+			m["root_folder_id"] = id
+			r, err := NewFs(context.Background(), "root-test", "", m)
+			require.NoError(t, err)
+			f := r.(*Fs)
+			t.Cleanup(func() { require.NoError(t, f.Shutdown(context.Background())) })
+			require.NoError(t, f.Rmdir(context.Background(), ""))
+			fx.mu.Lock()
+			defer fx.mu.Unlock()
+			if id != "" {
+				assert.Len(t, fx.folders, 1)
+			}
+		})
+	}
+}
+
+func TestRmdirAmbiguousDeletionCLI(t *testing.T) {
+	binary := os.Getenv("RCLONE_ASYNC_DELETE_TEST_BINARY")
+	if binary == "" {
+		t.Skip("set RCLONE_ASYNC_DELETE_TEST_BINARY to exercise command completion")
+	}
+	for _, cached := range []bool{false, true} {
+		t.Run(fmt.Sprint(cached), func(t *testing.T) {
+			fx := newFixture(t)
+			fx.folders = []api.Folder{{ID: "10", Name: "parent", Status: "U"}, {ID: "11", ParentID: "10", Name: "db", Status: "U"}}
+			fx.requestTime = 1700000000000
+			fx.changes = map[string]api.Changes{"folder": {New: []api.ID{"10", "11"}}}
+			var mu sync.Mutex
+			var deleted []api.ID
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/sapi/media/folder" || r.URL.Query().Get("action") != "delete" {
+					fx.serve(t, w, r)
+					return
+				}
+				body, err := io.ReadAll(r.Body)
+				assert.NoError(t, err)
+				var request struct {
+					Data struct {
+						Folders []api.ID `json:"folders"`
+					} `json:"data"`
+				}
+				assert.NoError(t, json.Unmarshal(body, &request))
+				r.Body = io.NopCloser(bytes.NewReader(body))
+				fx.serve(t, httptest.NewRecorder(), r)
+				mu.Lock()
+				deleted = append(deleted, request.Data.Folders...)
+				mu.Unlock()
+				fx.mu.Lock()
+				change := fx.changes["folder"]
+				change.New = slices.DeleteFunc(change.New, func(id api.ID) bool { return slices.Contains(request.Data.Folders, id) })
+				change.Deleted = append(change.Deleted, request.Data.Folders...)
+				fx.changes["folder"] = change
+				fx.requestTime += 1000
+				fx.mu.Unlock()
+				jsonReply(t, w, map[string]any{"error": &api.Error{Code: "FOL-1000", Message: "Unknown exception in folder handling"}})
+			}))
+			defer srv.Close()
+			args := []string{"purge", ":onemediahub:parent", "--config", "/notfound", "--cache-dir", t.TempDir(),
+				"--onemediahub-url", srv.URL, "--onemediahub-auth-type", authPassword, "--onemediahub-user", "test",
+				"--onemediahub-password", fx.config(t)["password"], "--onemediahub-async-delete", "--checkers", "1", "--retries", "3"}
+			if cached {
+				args = append(args, "--onemediahub-metadata-cache")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			child := exec.CommandContext(ctx, binary, args...)
+			for _, entry := range os.Environ() {
+				if !strings.HasPrefix(entry, "RCLONE_") {
+					child.Env = append(child.Env, entry)
+				}
+			}
+			output, err := child.CombinedOutput()
+			require.NoError(t, err, "%s", output)
+			mu.Lock()
+			assert.Equal(t, []api.ID{"11", "10"}, deleted)
+			mu.Unlock()
+			fx.mu.Lock()
+			assert.Empty(t, fx.folders)
+			fx.mu.Unlock()
+		})
+	}
+}
 
 func deleteTestFs(t *testing.T, checkers int, handler http.HandlerFunc, overrides ...configmap.Simple) *Fs {
 	f, _ := newDeleteTestFs(t, checkers, handler, overrides...)
