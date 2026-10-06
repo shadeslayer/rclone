@@ -2296,7 +2296,7 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 		return nil, err
 	}
 
-	if parent != "" && !slices.ContainsFunc(folders, func(folder api.Folder) bool {
+	if parent != "" && parent != "0" && !slices.ContainsFunc(folders, func(folder api.Folder) bool {
 		return string(folder.ID) == parent && !folder.IsDeleted()
 	}) {
 		return nil, fs.ErrorDirNotFound

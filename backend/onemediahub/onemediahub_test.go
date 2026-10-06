@@ -1528,6 +1528,30 @@ func (fx *fixture) serve(t *testing.T, w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		jsonReply(t, w, result)
+	case r.URL.Path == "/sapi/upload/file" && action == "save-metadata":
+		assert.Equal(t, http.MethodPost, r.Method)
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&envelope))
+		var data api.MetadataUpdate
+		var fields map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(envelope.Data, &data))
+		require.NoError(t, json.Unmarshal(envelope.Data, &fields))
+		assert.NotContains(t, fields, "size")
+		assert.NotContains(t, fields, "creationdate")
+		require.NotEmpty(t, data.ID)
+		require.NotEmpty(t, data.FolderID)
+		require.NotEmpty(t, data.Name)
+		modified, err := time.Parse(dateFormat, data.Modified)
+		require.NoError(t, err)
+		for i, item := range fx.media {
+			if string(item.ID) == data.ID {
+				fx.media[i].Name = data.Name
+				fx.media[i].FolderID = data.FolderID
+				fx.media[i].Modified = modified.UnixMilli()
+				jsonReply(t, w, map[string]any{"id": item.ID})
+				return
+			}
+		}
+		jsonReply(t, w, map[string]any{"error": &api.Error{Code: "COM-1014", Message: "Invalid media ID"}})
 	case (r.URL.Path == "/sapi/upload" || r.URL.Path == "/sapi/upload/file") && action == "save":
 		assert.Equal(t, http.MethodPost, r.Method)
 		if err := r.ParseMultipartForm(1 << 20); err != nil {

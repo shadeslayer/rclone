@@ -146,9 +146,14 @@ func TestRmdirAccountRoot(t *testing.T) {
 	for _, id := range []string{"", "0"} {
 		t.Run(id, func(t *testing.T) {
 			fx := newFixture(t)
-			if id != "" {
-				fx.folders = []api.Folder{{ID: api.ID(id), Name: "root", Status: "U"}}
-			}
+			var deletes atomic.Int32
+			handler := fx.server.Config.Handler
+			fx.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Get("action") == "delete" {
+					deletes.Add(1)
+				}
+				handler.ServeHTTP(w, r)
+			})
 			m := fx.config(t)
 			m["root_folder_id"] = id
 			r, err := NewFs(context.Background(), "root-test", "", m)
@@ -156,11 +161,7 @@ func TestRmdirAccountRoot(t *testing.T) {
 			f := r.(*Fs)
 			t.Cleanup(func() { require.NoError(t, f.Shutdown(context.Background())) })
 			require.NoError(t, f.Rmdir(context.Background(), ""))
-			fx.mu.Lock()
-			defer fx.mu.Unlock()
-			if id != "" {
-				assert.Len(t, fx.folders, 1)
-			}
+			assert.Zero(t, deletes.Load(), "the virtual account root is not a native folder")
 		})
 	}
 }
