@@ -61,6 +61,7 @@ const (
 	metadataMaxDelay     = 2 * time.Second
 	maxErrorSize         = 64 * 1024
 	sessionCookie        = "JSESSIONID"
+	metadataVersion      = 2
 )
 
 func init() {
@@ -602,6 +603,7 @@ type metadataCache struct {
 	state     *metadataSnapshot
 	checked   time.Time
 	byName    map[mediaKey]api.ID
+	dirty     bool
 }
 
 type mediaKey struct {
@@ -624,6 +626,7 @@ func (f *Fs) cacheMedia(item api.Media, remove bool) {
 	if c := f.metadata; c != nil {
 		c.mu.Lock()
 		defer c.mu.Unlock()
+		c.dirty = true
 		if old, ok := c.state.Media[item.ID]; ok && (remove || f.mediaKey(old) != f.mediaKey(item)) {
 			key := f.mediaKey(old)
 			if c.byName[key] == item.ID {
@@ -650,6 +653,7 @@ func (f *Fs) cacheFolder(folder api.Folder, remove bool) {
 	if c := f.metadata; c != nil {
 		c.mu.Lock()
 		defer c.mu.Unlock()
+		c.dirty = true
 		c.state.Folders = slices.DeleteFunc(c.state.Folders, func(old api.Folder) bool { return old.ID == folder.ID })
 		if !remove {
 			c.state.Folders = append(c.state.Folders, folder)
@@ -658,23 +662,42 @@ func (f *Fs) cacheFolder(folder api.Folder, remove bool) {
 }
 
 type metadataOp struct {
-	state *metadataSnapshot
-	write bool
+	state      *metadataSnapshot
+	write      bool
+	cursorOnly bool
 }
 
 func (op *metadataOp) Do(_ context.Context, bucket kv.Bucket) error {
 	key := []byte("metadata")
 	if !op.write {
 		if b := bucket.Get(key); b != nil {
-			return json.Unmarshal(b, &op.state)
+			if err := json.Unmarshal(b, &op.state); err != nil {
+				return err
+			}
+			if op.state == nil {
+				return errors.New("invalid cached metadata snapshot")
+			}
+			if b := bucket.Get([]byte("anchor")); b != nil {
+				anchor, err := strconv.ParseInt(string(b), 10, 64)
+				if err != nil || anchor < op.state.Anchor {
+					return errors.New("invalid cached changes cursor")
+				}
+				op.state.Anchor = anchor
+			}
 		}
 		return nil
+	}
+	if op.cursorOnly {
+		return bucket.Put([]byte("anchor"), []byte(strconv.FormatInt(op.state.Anchor, 10)))
 	}
 	b, err := json.Marshal(op.state)
 	if err != nil {
 		return err
 	}
-	return bucket.Put(key, b)
+	if err := bucket.Put(key, b); err != nil {
+		return err
+	}
+	return bucket.Delete([]byte("anchor"))
 }
 
 func (f *Fs) accountID(ctx context.Context) (string, error) {
@@ -716,7 +739,7 @@ func (f *Fs) startMetadataCache(ctx context.Context) error {
 		op := &metadataOp{}
 		if err := db.Do(false, op); err != nil && !errors.Is(err, kv.ErrEmpty) {
 			fs.Debugf(f, "Discarding unreadable metadata cache: %v", err)
-		} else if op.state != nil && op.state.Version == 1 && op.state.Anchor > 0 && op.state.Media != nil {
+		} else if op.state != nil && op.state.Version == metadataVersion && op.state.Anchor > 0 && op.state.Media != nil {
 			f.metadata.state = op.state
 			fs.Debugf(f, "Loaded metadata cache")
 		}
@@ -800,7 +823,7 @@ func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
 	if !c.checked.IsZero() && time.Since(c.checked) < time.Duration(f.opt.MetadataCacheTime) {
 		return false, nil
 	}
-	next := &metadataSnapshot{Version: 1, Media: map[api.ID]api.Media{}}
+	next := &metadataSnapshot{Version: metadataVersion, Media: map[api.ID]api.Media{}}
 	if c.state != nil {
 		*next = *c.state
 		next.Media = maps.Clone(c.state.Media)
@@ -859,6 +882,9 @@ func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
 	}
 	ids := map[api.ID]struct{}{}
 	locked := map[api.ID]struct{}{}
+	changedDownloads := map[api.ID]struct{}{}
+	metadataChanged := c.state == nil || c.dirty || foldersChanged
+	indexChanged := c.byName == nil
 	for _, id := range next.Pending {
 		ids[id] = struct{}{}
 	}
@@ -871,16 +897,39 @@ func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
 		}
 		for _, id := range change.Locked {
 			locked[id] = struct{}{}
+			changedDownloads[id] = struct{}{}
 		}
 		for _, id := range change.Deleted {
+			if _, ok := next.Media[id]; ok {
+				metadataChanged, indexChanged = true, true
+			}
 			delete(next.Media, id)
 			delete(ids, id)
+			changedDownloads[id] = struct{}{}
 		}
 	}
 	ordered := slices.Sorted(maps.Keys(ids))
 	for batch := range slices.Chunk(ordered, pageSize) {
-		if err := f.fetchMedia(ctx, batch, func(item api.Media) error {
-			next.Media[item.ID] = item
+		if err := f.fetchMedia(ctx, batch, true, func(item api.Media) error {
+			old, found := next.Media[item.ID]
+			if item.SoftDeleted || item.Status == statusDeleted {
+				delete(next.Media, item.ID)
+				delete(ids, item.ID)
+				metadataChanged = metadataChanged || found
+				indexChanged = indexChanged || found
+				changedDownloads[item.ID] = struct{}{}
+				return nil
+			}
+			if sameMediaContent(old, item) && item.Status != "L" {
+				item.URL = old.URL
+			} else {
+				changedDownloads[item.ID] = struct{}{}
+			}
+			if !found || old != item {
+				metadataChanged = true
+				indexChanged = indexChanged || !found || f.mediaKey(old) != f.mediaKey(item)
+				next.Media[item.ID] = item
+			}
 			if _, isLocked := locked[item.ID]; !isLocked && item.Status != "L" {
 				delete(ids, item.ID)
 			}
@@ -891,24 +940,25 @@ func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
 	}
 	// Unfinished uploads may not yet be visible to the metadata endpoint.
 	next.Pending = slices.Sorted(maps.Keys(ids))
+	if c.state != nil && !slices.Equal(c.state.Pending, next.Pending) {
+		metadataChanged = true
+	}
 	next.Anchor = timestamp
 	if c.db != nil {
-		if err := c.db.Do(true, &metadataOp{state: next, write: true}); err != nil {
+		if err := c.db.Do(true, &metadataOp{state: next, write: true, cursorOnly: !metadataChanged}); err != nil {
 			return false, fmt.Errorf("save metadata cache: %w", err)
 		}
 	}
-	for source, change := range changes {
-		if source == "folder" {
-			continue
-		}
-		for _, id := range slices.Concat(change.New, change.Updated, change.Deleted, change.Locked) {
-			f.downloadURLs.DeletePrefix(string(id) + "/")
-		}
+	for id := range changedDownloads {
+		f.downloadURLs.DeletePrefix(string(id) + "/")
 	}
 	c.state = next
-	c.byName = make(map[mediaKey]api.ID, len(next.Media))
-	for _, id := range slices.Sorted(maps.Keys(next.Media)) {
-		c.byName[f.mediaKey(next.Media[id])] = id
+	c.dirty = false
+	if indexChanged {
+		c.byName = make(map[mediaKey]api.ID, len(next.Media))
+		for _, id := range slices.Sorted(maps.Keys(next.Media)) {
+			c.byName[f.mediaKey(next.Media[id])] = id
+		}
 	}
 	c.checked = time.Now()
 	fs.Debugf(f, "Refreshed metadata cache: fetched %d media IDs, %d pending", len(ordered), len(next.Pending))
@@ -1041,13 +1091,13 @@ func (f *Fs) media(ctx context.Context, ids []api.ID, visit func(api.Media) erro
 		}
 		return nil
 	}
-	return f.fetchMedia(ctx, ids, visit)
+	return f.fetchMedia(ctx, ids, false, visit)
 }
 
-func (f *Fs) fetchMedia(ctx context.Context, ids []api.ID, visit func(api.Media) error) error {
+func (f *Fs) fetchMedia(ctx context.Context, ids []api.ID, includeDeleted bool, visit func(api.Media) error) error {
 	for offset := 0; ; {
 		params := url.Values{}
-		data := map[string]any{"fields": []string{"name", "size", "modificationdate", "url", "folderid"}}
+		data := map[string]any{"fields": []string{"name", "size", "modificationdate", "url", "folderid", "etag"}}
 		if ids != nil {
 			data["ids"] = ids
 		} else {
@@ -1066,7 +1116,7 @@ func (f *Fs) fetchMedia(ctx context.Context, ids []api.ID, visit func(api.Media)
 			return err
 		}
 		for _, item := range result.Media {
-			if item.SoftDeleted || item.Status == statusDeleted {
+			if !includeDeleted && (item.SoftDeleted || item.Status == statusDeleted) {
 				continue
 			}
 
@@ -1444,7 +1494,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	if o.Size() == 0 {
 		return io.NopCloser(strings.NewReader("")), nil
 	}
-	key := fmt.Sprintf("%s/%d/%d/%d", o.info.ID, o.info.Size, o.info.Modified, o.info.Date)
+	key := o.downloadKey()
 	rawURL := o.info.URL
 	if cached, ok := o.fs.downloadURLs.GetMaybe(key); ok {
 		rawURL = cached.(string)
@@ -1482,6 +1532,17 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 
 var errDownloadURLExpired = errors.New("expired media download URL")
 
+func sameMediaContent(a, b api.Media) bool {
+	return a.ETag != "" && a.ETag == b.ETag && a.Size == b.Size
+}
+
+func (o *Object) downloadKey() string {
+	if o.info.ETag != "" {
+		return fmt.Sprintf("%s/etag/%q/%d", o.info.ID, o.info.ETag, o.info.Size)
+	}
+	return fmt.Sprintf("%s/%d/%d/%d", o.info.ID, o.info.Size, o.info.Modified, o.info.Date)
+}
+
 func (o *Object) refreshDownloadURL(ctx context.Context, key, expired string) (string, error) {
 	result := o.fs.downloadRefresh.DoChan(key, func() (any, error) {
 		if cached, ok := o.fs.downloadURLs.GetMaybe(key); ok && cached.(string) != expired {
@@ -1493,7 +1554,7 @@ func (o *Object) refreshDownloadURL(ctx context.Context, key, expired string) (s
 		if err := snapshot.refresh(lookupCtx); err != nil {
 			return nil, err
 		}
-		if snapshot.info.Size != o.info.Size || o.info.Modified != 0 && snapshot.info.Modified != o.info.Modified {
+		if o.info.ETag != "" && !sameMediaContent(o.info, snapshot.info) || o.info.Size != snapshot.info.Size || o.info.ETag == "" && o.info.Modified != 0 && snapshot.info.Modified != o.info.Modified {
 			return nil, errors.New("media changed while opening download")
 		}
 		if snapshot.info.URL == "" {

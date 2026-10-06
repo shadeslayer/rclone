@@ -97,6 +97,7 @@ type Media struct {
 	Modified    int64  `json:"modificationdate"` // Modified is the modification time in milliseconds.
 	Date        int64  `json:"date"`             // Date is the server update time in milliseconds.
 	URL         string `json:"url"`              // URL downloads the original content.
+	ETag        string `json:"etag"`             // ETag is an opaque server content version.
 	Type        string `json:"mediatype"`        // Type is file, picture, video, or audio.
 	Status      string `json:"status"`           // Status is the upload status.
 	SoftDeleted bool   `json:"softdeleted"`      // SoftDeleted indicates a trashed item.

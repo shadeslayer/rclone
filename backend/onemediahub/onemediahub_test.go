@@ -1,6 +1,7 @@
 package onemediahub
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -28,6 +29,7 @@ import (
 	"github.com/rclone/rclone/fs/config/obscure"
 	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fstest/fstests"
+	"github.com/rclone/rclone/lib/kv"
 	"github.com/rclone/rclone/lib/oauthutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -229,6 +231,117 @@ func TestDirMove(t *testing.T) {
 			assert.Zero(t, fx.requests["/sapi/upload"])
 		})
 	}
+}
+
+type snapshotBytes struct{ data []byte }
+
+func (op *snapshotBytes) Do(_ context.Context, bucket kv.Bucket) error {
+	op.data = slices.Clone(bucket.Get([]byte("metadata")))
+	return nil
+}
+
+func TestETagMetadataCache(t *testing.T) {
+	cacheDir := config.GetCacheDir()
+	require.NoError(t, config.SetCacheDir(t.TempDir()))
+	t.Cleanup(func() { require.NoError(t, config.SetCacheDir(cacheDir)) })
+	ctx := context.Background()
+	fx := newFixture(t)
+	fx.requestTime = 1700000000123
+	fx.changes = map[string]api.Changes{"file": {New: []api.ID{"1"}}}
+	var expiredCalls atomic.Int32
+	expired := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { expiredCalls.Add(1); w.WriteHeader(http.StatusForbidden) }))
+	defer expired.Close()
+	fx.media = []api.Media{{ID: "1", Name: "file", Size: 6, Date: 1, Modified: 1000, URL: expired.URL, ETag: "version-one"}}
+	fx.content["1"] = "abcdef"
+	m := fx.config(t)
+	m["metadata_cache"] = "true"
+	remote, err := NewFs(ctx, "etag-test", "", m)
+	require.NoError(t, err)
+	f := remote.(*Fs)
+	t.Cleanup(func() { require.NoError(t, f.Shutdown(ctx)) })
+	o, err := f.NewObject(ctx, "file")
+	require.NoError(t, err)
+	fx.mu.Lock()
+	fx.media[0].URL = fx.server.URL + "/content/1"
+	fx.mu.Unlock()
+	read := func(o fs.Object) {
+		body, err := o.Open(ctx)
+		require.NoError(t, err)
+		b, err := io.ReadAll(body)
+		require.NoError(t, err)
+		require.NoError(t, body.Close())
+		require.Equal(t, "abcdef", string(b))
+	}
+	read(o)
+	// A rename and timestamp update leave the content version unchanged.
+	fx.mu.Lock()
+	fx.media[0].Name = "renamed"
+	fx.media[0].URL = expired.URL
+	fx.media[0].Date = 2
+	fx.media[0].Modified = 2000
+	fx.changes = map[string]api.Changes{"file": {Updated: []api.ID{"1"}}}
+	fx.requestTime += 1000
+	fx.mu.Unlock()
+	f.expireMetadata()
+	o, err = f.NewObject(ctx, "renamed")
+	require.NoError(t, err)
+	fx.mu.Lock()
+	fx.media[0].URL = fx.server.URL + "/content/1"
+	fx.mu.Unlock()
+	read(o)
+	assert.EqualValues(t, 1, expiredCalls.Load())
+	assert.Equal(t, time.UnixMilli(2000), o.ModTime(ctx))
+	_, err = f.NewObject(ctx, "file")
+	assert.ErrorIs(t, err, fs.ErrorObjectNotFound)
+	before := &snapshotBytes{}
+	require.NoError(t, f.metadata.db.Do(false, before))
+	// Overlapping unchanged deltas advance only the persisted cursor.
+	fx.mu.Lock()
+	fx.requestTime += 1000
+	fx.mu.Unlock()
+	f.expireMetadata()
+	require.NoError(t, f.syncMetadata(ctx))
+	after := &snapshotBytes{}
+	require.NoError(t, f.metadata.db.Do(false, after))
+	assert.True(t, bytes.Equal(before.data, after.data), "unchanged metadata snapshot was rewritten")
+	loaded := &metadataOp{}
+	require.NoError(t, f.metadata.db.Do(false, loaded))
+	assert.Equal(t, f.metadata.state.Anchor, loaded.state.Anchor)
+	// A changed token invalidates the URL even when size/time are identical.
+	fx.mu.Lock()
+	fx.media[0].ETag = "version-two"
+	fx.media[0].URL = expired.URL
+	fx.requestTime += 1000
+	fx.mu.Unlock()
+	f.expireMetadata()
+	o, err = f.NewObject(ctx, "renamed")
+	require.NoError(t, err)
+	fx.mu.Lock()
+	fx.media[0].URL = fx.server.URL + "/content/1"
+	fx.mu.Unlock()
+	read(o)
+	assert.EqualValues(t, 2, expiredCalls.Load())
+	// Local writes must be persisted before advancing a cursor without changes.
+	local := api.Media{ID: "2", Name: "local", Size: 1, ETag: "local-version"}
+	f.cacheMedia(local, false)
+	fx.mu.Lock()
+	fx.changes = map[string]api.Changes{}
+	fx.requestTime += 1000
+	fx.mu.Unlock()
+	f.expireMetadata()
+	require.NoError(t, f.syncMetadata(ctx))
+	loaded = &metadataOp{}
+	require.NoError(t, f.metadata.db.Do(false, loaded))
+	assert.Equal(t, local, loaded.state.Media["2"])
+	assert.Equal(t, f.metadata.state.Anchor, loaded.state.Anchor)
+	fx.mu.Lock()
+	fx.media[0].SoftDeleted = true
+	fx.changes = map[string]api.Changes{"file": {Updated: []api.ID{"1"}}}
+	fx.requestTime += 1000
+	fx.mu.Unlock()
+	f.expireMetadata()
+	_, err = f.NewObject(ctx, "renamed")
+	assert.ErrorIs(t, err, fs.ErrorObjectNotFound)
 }
 
 func TestMetadataCacheDeletedRoot(t *testing.T) {
