@@ -622,6 +622,32 @@ func retry(ctx context.Context, resp *http.Response, err error) (bool, error) {
 	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, []int{http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout}), err
 }
 
+type permanentUploadError struct{ error }
+
+func (e permanentUploadError) Retry() bool   { return false }
+func (e permanentUploadError) Unwrap() error { return e.error }
+
+func uploadError(err error) error {
+	var serviceError *api.Error
+	if !errors.As(err, &serviceError) {
+		return err
+	}
+	switch serviceError.Code {
+	case "MED-1007", "MED-1029", "MED-1050", "COM-1008", "COM-1011", "COM-1014", "COM-1005":
+		if fserrors.IsNoRetryError(err) {
+			return err
+		}
+		// A read pacer may already have wrapped the server error for retry.
+		return fserrors.NoRetryError(permanentUploadError{err})
+	case "MED-1006", "MED-1017":
+		if fserrors.IsRetryError(err) {
+			return err
+		}
+		return fserrors.RetryError(err)
+	}
+	return err
+}
+
 func (f *Fs) callRead(ctx context.Context, run pacer.Paced) error {
 	var blockedUntil time.Time
 	return f.pacer.Call(func() (bool, error) {
@@ -717,6 +743,15 @@ func (f *Fs) callWithReplay(ctx context.Context, opts rest.Opts, request any, re
 			}
 			if errors.Is(err, errCloudFrontBlocked) && !readOnly {
 				return false, err
+			}
+			if strings.HasPrefix(opts.Path, "/upload") || action == "get-validation-status" {
+				err = uploadError(err)
+				if fserrors.IsNoRetryError(err) {
+					return false, err
+				}
+				if fserrors.IsRetryError(err) {
+					return true, err
+				}
 			}
 			return retry(ctx, resp, err)
 		}
@@ -3504,6 +3539,7 @@ func (f *Fs) open(ctx context.Context, u *url.URL, options []fs.OpenOption) (io.
 
 // Update replaces content and waits for the uploaded object to be available.
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
+	defer func() { err = uploadError(err) }()
 	if err := o.fs.flushDeletions(ctx); err != nil {
 		return err
 	}
@@ -4137,12 +4173,12 @@ func (o *Object) uploadAsync(ctx context.Context, in io.Reader, data api.Upload,
 			}
 			break
 		}
-		if ctx.Err() != nil || attempt+1 >= max(1, fs.GetConfig(ctx).LowLevelRetries) || !fserrors.IsRetryError(err) && !fserrors.ShouldRetry(err) {
+		if fserrors.IsNoRetryError(err) || ctx.Err() != nil || attempt+1 >= max(1, fs.GetConfig(ctx).LowLevelRetries) || !fserrors.IsRetryError(err) && !fserrors.ShouldRetry(err) {
 			return fmt.Errorf("upload media %s: %w", o.info.ID, err)
 		}
 		confirmed, probeErr := o.uploadOffset(ctx, size)
 		if probeErr != nil {
-			return fmt.Errorf("resume upload media %s after %v: %w", o.info.ID, err, probeErr)
+			return fmt.Errorf("resume upload media %s after %w: %w", o.info.ID, err, probeErr)
 		}
 		if confirmed > available {
 			return errors.New("upload offset exceeds bytes sent")
