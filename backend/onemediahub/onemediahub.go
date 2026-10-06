@@ -71,6 +71,7 @@ const (
 	sessionCookie        = "JSESSIONID"
 	metadataVersion      = 2
 	uploadJournalVersion = 1
+	mediaJournalVersion  = 2
 )
 
 func init() {
@@ -215,6 +216,13 @@ func init() {
 				Advanced: true,
 			},
 			{
+				Name:     "upload_source",
+				Help:     "Upload route for new files. The default file route stores ordinary file content. Auto selects picture, audio or video routes from MIME types; other files, transformed sources such as crypt, and flat namespaces use file uploads. Existing media keeps its source type with auto. Native media requires supported content and filename extensions.",
+				Default:  "file",
+				Advanced: true,
+				Examples: []fs.OptionExample{{Value: "file", Help: "Use generic file uploads."}, {Value: "auto", Help: "Select native media upload routes automatically."}},
+			},
+			{
 				Name:     "flat_namespace",
 				Help:     "Store files under encoded full-path names in one physical folder to avoid the server's folder-count limit. Directories are virtual; empty directories use marker files. Long paths require small immutable mapping files, retained after removal and hidden from rclone. O2's apps display encoded names and mapping files. Only files written with this option are visible; existing files are not migrated. Set root_folder_id to an existing folder, or leave it empty to use unfiled media. Use metadata_cache and --fast-list for large trees.",
 				Default:  false,
@@ -284,6 +292,7 @@ type options struct {
 	DeviceID          string               `config:"device_id"`
 	UserAgent         string               `config:"user_agent"`
 	UploadURL         string               `config:"upload_url"`
+	UploadSource      string               `config:"upload_source"`
 	AsyncUpload       bool                 `config:"async_upload"`
 	ResumeUploads     bool                 `config:"resume_uploads"` // ResumeUploads enables persistent upload recovery.
 	UploadTimeout     fs.Duration          `config:"upload_timeout"`
@@ -324,6 +333,9 @@ func readOptions(m configmap.Mapper) (*options, error) {
 
 	if opt.AuthType != authOAuth && opt.AuthType != authPassword {
 		return nil, errors.New("auth_type must be oauth or password")
+	}
+	if opt.UploadSource != "file" && opt.UploadSource != "auto" {
+		return nil, errors.New("upload_source must be file or auto")
 	}
 	if opt.AsyncUpload && opt.UploadTimeout <= 0 {
 		return nil, errors.New("upload_timeout must be positive")
@@ -399,6 +411,7 @@ type Object struct {
 	info          api.Media
 	flatDirectory bool // flatDirectory identifies a marker whose remote is the full virtual path.
 	flatMapping   bool // flatMapping identifies an immutable path mapping whose remote is the full virtual path.
+	uploadSource  string
 }
 
 // NewFs creates a OneMediaHub filesystem, returning ErrorIsFile for a file root.
@@ -3101,7 +3114,11 @@ func (o *Object) saveMetadata(ctx context.Context, name string, parent api.ID, m
 		parent = "0"
 	}
 	data := api.MetadataUpdate{ID: string(o.info.ID), FolderID: parent, Name: name, Modified: modified.UTC().Format(dateFormat)}
-	reply, err := o.fs.call(ctx, rest.Opts{Method: http.MethodPost, RootURL: o.fs.uploadURL, Path: "/upload/file", Parameters: url.Values{"action": {"save-metadata"}}, ContentType: "application/octet-stream"}, map[string]any{"data": data})
+	source := o.info.Type
+	if !supportedUploadSource(source) {
+		source = "file"
+	}
+	reply, err := o.fs.call(ctx, rest.Opts{Method: http.MethodPost, RootURL: o.fs.uploadURL, Path: "/upload/" + source, Parameters: url.Values{"action": {"save-metadata"}}, ContentType: "application/octet-stream"}, map[string]any{"data": data})
 	if err != nil {
 		return err
 	}
@@ -3172,6 +3189,35 @@ func (o *Object) waitMetadata(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("wait for uploaded media: %w", ctx.Err())
+		case <-time.After(delay):
+		}
+		delay = min(2*delay, metadataMaxDelay)
+	}
+}
+
+func (o *Object) waitNativeMetadata(ctx context.Context, data api.Upload) error {
+	ctx, cancel := context.WithTimeout(ctx, metadataTimeout)
+	defer cancel()
+	modified, err := time.Parse(dateFormat, data.Modified)
+	if err != nil {
+		return err
+	}
+	delay := metadataDelay
+	for {
+		item, err := o.lookupUploadMetadata(ctx)
+		if err != nil && !errors.Is(err, fs.ErrorObjectNotFound) {
+			return err
+		}
+		if err == nil && item.Type == o.uploadSourceType() && uploadStatusComplete(item.Type, item.Status) &&
+			item.Name == data.Name && sameParent(item.FolderID, string(data.FolderID)) && item.Size == data.Size &&
+			item.Modified == modified.UnixMilli() && item.URL != "" && !item.IsDeleted() {
+			o.info = item
+			o.fs.cacheMedia(item, false)
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for native uploaded media: %w", ctx.Err())
 		case <-time.After(delay):
 		}
 		delay = min(2*delay, metadataMaxDelay)
@@ -3278,15 +3324,16 @@ func (o *Object) useUploadMetadata(reply api.Response, data api.Upload) bool {
 		return false
 	}
 	var sources map[string][]json.RawMessage
-	if json.Unmarshal(reply.Metadata, &sources) != nil || len(sources["files"]) != 1 {
+	source := o.uploadSourceType()
+	if json.Unmarshal(reply.Metadata, &sources) != nil || len(sources[source+"s"]) != 1 {
 		return false
 	}
-	for _, source := range []string{"pictures", "videos", "audios"} {
-		if len(sources[source]) != 0 {
+	for _, other := range []string{"files", "pictures", "videos", "audios"} {
+		if other != source+"s" && len(sources[other]) != 0 {
 			return false
 		}
 	}
-	raw := sources["files"][0]
+	raw := sources[source+"s"][0]
 	var fields map[string]json.RawMessage
 	var item api.Media
 	if json.Unmarshal(raw, &fields) != nil || json.Unmarshal(raw, &item) != nil {
@@ -3309,7 +3356,7 @@ func (o *Object) useUploadMetadata(reply api.Response, data api.Upload) bool {
 	if item.Status == "" {
 		item.Status = status
 	}
-	if item.Status != "V" || status != "" && status != item.Status {
+	if !uploadStatusComplete(source, item.Status) || status != "" && status != item.Status {
 		return false
 	}
 	if item.ETag == "" {
@@ -3319,9 +3366,9 @@ func (o *Object) useUploadMetadata(reply api.Response, data api.Upload) bool {
 		return false
 	}
 	if item.Type == "" {
-		item.Type = "file"
+		item.Type = source
 	}
-	if item.Type != "file" {
+	if item.Type != source {
 		return false
 	}
 	modified, err := time.Parse(dateFormat, data.Modified)
@@ -3537,7 +3584,65 @@ func (f *Fs) open(ctx context.Context, u *url.URL, options []fs.OpenOption) (io.
 	return resp.Body, nil
 }
 
-// Update replaces content and waits for the uploaded object to be available.
+func supportedUploadSource(source string) bool {
+	return source == "file" || source == "picture" || source == "audio" || source == "video"
+}
+
+func (o *Object) uploadSourceType() string {
+	if o.uploadSource != "" {
+		return o.uploadSource
+	}
+	if o.fs.opt.UploadSource == "auto" && supportedUploadSource(o.info.Type) {
+		return o.info.Type
+	}
+	return "file"
+}
+
+func (o *Object) uploadPath() string { return "/upload/" + o.uploadSourceType() }
+
+func transformedUploadSource(src fs.ObjectInfo) bool {
+	source := src.Fs()
+	return source != nil && source.Features() != nil && source.Features().Overlay
+}
+
+func uploadStatusComplete(source, status string) bool {
+	// Native media routes return U with completed metadata; file processing uses V.
+	return source == "file" && status == "V" || source != "file" && status == "U"
+}
+
+func (o *Object) chooseUploadSource(ctx context.Context, src fs.ObjectInfo) (string, error) {
+	if o.fs.opt.UploadSource != "auto" || o.fs.opt.FlatNamespace || o.flatDirectory || o.flatMapping {
+		return "file", nil
+	}
+	if transformedUploadSource(src) {
+		if o.info.ID != "" && supportedUploadSource(o.info.Type) && o.info.Type != "file" {
+			return "", errors.New("cannot replace native media with transformed content")
+		}
+		return "file", nil
+	}
+	if o.info.ID != "" {
+		if supportedUploadSource(o.info.Type) {
+			return o.info.Type, nil
+		}
+		return "file", nil
+	}
+	if src.Size() == 0 {
+		return "file", nil
+	}
+	contentType := strings.ToLower(fs.MimeType(ctx, src))
+	switch {
+	case strings.HasPrefix(contentType, "image/"):
+		return "picture", nil
+	case strings.HasPrefix(contentType, "audio/"):
+		return "audio", nil
+	case strings.HasPrefix(contentType, "video/"):
+		return "video", nil
+	default:
+		return "file", nil
+	}
+}
+
+// Update creates or replaces content and preserves the upload modification time.
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
 	defer func() { err = uploadError(err) }()
 	if err := o.fs.flushDeletions(ctx); err != nil {
@@ -3575,8 +3680,14 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if err != nil {
 		return err
 	}
-	modified := src.ModTime(ctx).UTC().Format(dateFormat)
+	originalModTime := src.ModTime(ctx)
+	modified := originalModTime.UTC().Format(dateFormat)
 	data := api.Upload{ID: string(o.info.ID), FolderID: api.ID(parent), Name: o.fs.opt.Enc.FromStandardName(leaf), Size: src.Size(), ContentType: fs.MimeType(ctx, src), Created: modified, Modified: modified}
+	o.uploadSource, err = o.chooseUploadSource(ctx, src)
+	if err != nil {
+		return err
+	}
+	defer func() { o.uploadSource = "" }()
 	if o.fs.opt.FlatNamespace {
 		defer func() {
 			nameMatches := o.info.Name == data.Name || o.flatDirectory && o.info.Size == 0 && o.fs.mediaKey(o.info).name == leaf
@@ -3589,12 +3700,37 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return o.uploadAsync(ctx, in, data, options, src)
 	}
 	endpoint := "/upload"
-	if o.info.ID != "" {
-		endpoint = "/upload/file"
+	if o.info.ID != "" || o.uploadSourceType() != "file" {
+		endpoint = o.uploadPath()
 	}
 	size := src.Size()
 	opts := rest.Opts{Method: http.MethodPost, RootURL: o.fs.uploadURL, Path: endpoint, Parameters: url.Values{"action": {"save"}}, Body: in, ContentLength: &size, Options: options, MultipartMetadataName: "data", MultipartContentName: "file", MultipartFileName: data.Name, MultipartContentType: data.ContentType}
-	reply, err := o.fs.call(ctx, opts, map[string]any{"data": data})
+	var uploaded *readers.CountingReader
+	var replay func() (io.ReadCloser, error)
+	if o.uploadSourceType() != "file" {
+		uploaded = readers.NewCountingReader(in)
+		opts.Body = uploaded
+		reader, wrap := accounting.UnWrap(in)
+		if seeker, ok := reader.(io.ReadSeeker); ok {
+			if start, seekErr := seeker.Seek(0, io.SeekCurrent); seekErr == nil {
+				replay = func() (io.ReadCloser, error) {
+					if err := checkUploadSource(ctx, src, size, originalModTime, nil); err != nil {
+						return nil, err
+					}
+					position, err := seeker.Seek(start, io.SeekStart)
+					if err != nil {
+						return nil, err
+					}
+					if position != start {
+						return nil, errors.New("native upload input returned an unexpected rewind position")
+					}
+					uploaded = readers.NewCountingReader(wrap(seeker))
+					return io.NopCloser(uploaded), nil
+				}
+			}
+		}
+	}
+	reply, err := o.fs.callWithReplay(ctx, opts, map[string]any{"data": data}, replay)
 	if err != nil {
 		return err
 	}
@@ -3606,8 +3742,14 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return errors.New("upload returned an unexpected replacement media ID")
 	}
 	o.info.ID = reply.ID
+	if uploaded != nil && int64(uploaded.BytesRead()) != size {
+		return errors.New("native upload returned before accepting all content")
+	}
 	if o.useUploadMetadata(reply, data) {
 		return nil
+	}
+	if o.uploadSourceType() != "file" {
+		return o.waitNativeMetadata(ctx, data)
 	}
 	return o.waitMetadata(ctx)
 }
@@ -3615,6 +3757,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 type uploadRecord struct {
 	Version    int       // Version identifies the journal schema.
 	ID         api.ID    // ID identifies the unfinished media item.
+	MediaType  string    `json:",omitempty"` // MediaType identifies its upload source; version 1 records use file.
 	FolderID   api.ID    // FolderID identifies the destination parent.
 	Name       string    // Name is the encoded destination filename.
 	Size       int64     // Size is the expected content length.
@@ -3623,6 +3766,21 @@ type uploadRecord struct {
 	HashType   string    // HashType identifies the source checksum algorithm.
 	Hash       string    // Hash verifies the source content against the upload input.
 	Processing bool      // Processing indicates all bytes are accepted, awaiting validation and metadata.
+}
+
+func (r *uploadRecord) valid() bool {
+	if r == nil || r.ID == "" {
+		return false
+	}
+	return r.Version == uploadJournalVersion && (r.MediaType == "" || r.MediaType == "file") ||
+		r.Version == mediaJournalVersion && supportedUploadSource(r.MediaType) && r.MediaType != "file"
+}
+
+func (r *uploadRecord) setSource(source string) {
+	r.MediaType, r.Version = source, uploadJournalVersion
+	if source != "file" {
+		r.Version = mediaJournalVersion
+	}
 }
 
 type uploadJournalOp struct {
@@ -3640,7 +3798,7 @@ func (op *uploadJournalOp) Do(_ context.Context, bucket kv.Bucket) error {
 			if err := json.Unmarshal(value, &record); err != nil {
 				return err
 			}
-			if record == nil || record.Version != uploadJournalVersion || record.ID == "" {
+			if !record.valid() {
 				return errors.New("invalid upload recovery record")
 			}
 			if _, found := op.items[record.ID]; found {
@@ -3665,7 +3823,7 @@ func (op *uploadJournalOp) Do(_ context.Context, bucket kv.Bucket) error {
 		if err := json.Unmarshal(b, &op.record); err != nil {
 			return err
 		}
-		if op.record == nil {
+		if !op.record.valid() {
 			return errors.New("invalid upload recovery record")
 		}
 	}
@@ -3935,8 +4093,9 @@ func (o *Object) prepareUploadRecovery(ctx context.Context, data api.Upload, src
 				break
 			}
 			identity, _ := json.Marshal([]string{r.source.Fs().Name(), r.source.Fs().Root(), r.source.Remote()})
-			r.record = &uploadRecord{Version: uploadJournalVersion, FolderID: data.FolderID, Name: data.Name,
+			r.record = &uploadRecord{FolderID: data.FolderID, Name: data.Name,
 				Size: data.Size, Modified: src.ModTime(ctx), Source: string(identity), HashType: hashType.String(), Hash: sum}
+			r.record.setSource(o.uploadSourceType())
 			break
 		}
 	}
@@ -3945,9 +4104,6 @@ func (o *Object) prepareUploadRecovery(ctx context.Context, data api.Upload, src
 		return nil, fmt.Errorf("read upload recovery: %w", err)
 	}
 	if old := op.record; old != nil {
-		if old.Version != uploadJournalVersion || old.ID == "" {
-			return nil, errors.New("invalid upload recovery record")
-		}
 		if next := r.record; next != nil && sameParent(old.FolderID, string(next.FolderID)) && old.Name == next.Name && old.Size == next.Size &&
 			old.Modified.Equal(next.Modified) && old.Source == next.Source && old.HashType == next.HashType && old.Hash == next.Hash &&
 			(data.ID == "" || data.ID == string(old.ID)) {
@@ -4017,6 +4173,23 @@ func (o *Object) uploadAsync(ctx context.Context, in io.Reader, data api.Upload,
 	if recovery != nil {
 		defer func() { _ = recovery.lock.Unlock() }()
 		in = recovery.reader
+		previous := recovery.previous
+		if recovery.existing {
+			previous = recovery.record
+		}
+		if previous != nil {
+			source := previous.MediaType
+			if source == "" {
+				source = "file"
+			}
+			o.uploadSource = source
+		}
+		if recovery.record != nil {
+			recovery.record.setSource(o.uploadSourceType())
+		}
+	}
+	if o.uploadSourceType() != "file" && transformedUploadSource(src) {
+		return errors.New("cannot resume native media with transformed content")
 	}
 	var reply api.Response
 	if o.fs.opt.ResumeUploads {
@@ -4032,6 +4205,9 @@ func (o *Object) uploadAsync(ctx context.Context, in io.Reader, data api.Upload,
 			if err := o.fs.fetchMedia(ctx, []api.ID{id}, true, func(item api.Media) error {
 				if item.ID != id {
 					return errors.New("upload destination lookup returned an unexpected media ID")
+				}
+				if item.Type != "" && item.Type != o.uploadSourceType() {
+					return errors.New("upload recovery source type does not match the destination")
 				}
 				found = true
 				if item.IsDeleted() {
@@ -4059,7 +4235,7 @@ func (o *Object) uploadAsync(ctx context.Context, in io.Reader, data api.Upload,
 		if err != nil {
 			return err
 		}
-		opts := rest.Opts{Method: http.MethodPost, RootURL: o.fs.uploadURL, Path: "/upload/file", Parameters: url.Values{"action": {"save-metadata"}, "responsetime": {"true"}, "lastupdate": {"true"}}, ContentType: "application/octet-stream", Body: bytes.NewReader(metadata)}
+		opts := rest.Opts{Method: http.MethodPost, RootURL: o.fs.uploadURL, Path: o.uploadPath(), Parameters: url.Values{"action": {"save-metadata"}, "responsetime": {"true"}, "lastupdate": {"true"}}, ContentType: "application/octet-stream", Body: bytes.NewReader(metadata)}
 		reply, err = o.fs.call(ctx, opts, nil)
 		if err != nil {
 			return fmt.Errorf("register upload metadata: %w", err)
@@ -4087,7 +4263,7 @@ func (o *Object) uploadAsync(ctx context.Context, in io.Reader, data api.Upload,
 		// net/http treats an arbitrary reader with zero ContentLength as an unknown length.
 		in = http.NoBody
 	}
-	opts := rest.Opts{Method: http.MethodPost, RootURL: o.fs.uploadURL, Path: "/upload/file",
+	opts := rest.Opts{Method: http.MethodPost, RootURL: o.fs.uploadURL, Path: o.uploadPath(),
 		Parameters: url.Values{"action": {"save"}, "lastupdate": {"true"}, "acceptasynchronous": {"true"}},
 		Body:       in, ContentType: data.ContentType, ContentLength: &size, Options: options,
 		ExtraHeaders: map[string]string{"X-funambol-id": string(o.info.ID), "X-funambol-file-size": strconv.FormatInt(size, 10)}}
@@ -4162,6 +4338,9 @@ func (o *Object) uploadAsync(ctx context.Context, in io.Reader, data api.Upload,
 		reply, err = o.fs.callWithReplay(ctx, opts, nil, replay)
 		available = max(available, offset+int64(counter.BytesRead()))
 		if err == nil {
+			if o.uploadSourceType() != "file" && int64(counter.BytesRead()) != size-offset {
+				return errors.New("native upload returned before accepting all content")
+			}
 			if reply.ID != "" && reply.ID != o.info.ID {
 				return fmt.Errorf("upload returned media ID %s, expected %s", reply.ID, o.info.ID)
 			}
@@ -4225,6 +4404,12 @@ func (o *Object) uploadAsync(ctx context.Context, in io.Reader, data api.Upload,
 		return fmt.Errorf("upload returned media ID %s, expected %s", reply.ID, o.info.ID)
 	}
 	if !o.useUploadMetadata(reply, data) {
+		if o.uploadSourceType() != "file" {
+			if err := o.waitNativeMetadata(ctx, data); err != nil {
+				return err
+			}
+			return o.completeUploadRecovery(recovery, data)
+		}
 		if err := o.waitUpload(ctx, data.FolderID); err != nil {
 			return err
 		}
@@ -4237,7 +4422,7 @@ func (o *Object) uploadAsync(ctx context.Context, in io.Reader, data api.Upload,
 
 func (o *Object) uploadOffset(ctx context.Context, size int64) (int64, error) {
 	zero := int64(0)
-	opts := rest.Opts{Method: http.MethodPost, RootURL: o.fs.uploadURL, Path: "/upload/file", Parameters: url.Values{"action": {"save"}, "lastupdate": {"true"}, "acceptasynchronous": {"true"}}, Body: http.NoBody, ContentLength: &zero, ContentRange: fmt.Sprintf("bytes */%d", size), IgnoreStatus: true, NoResponse: true, ExtraHeaders: map[string]string{"X-funambol-id": string(o.info.ID), "X-funambol-file-size": strconv.FormatInt(size, 10)}}
+	opts := rest.Opts{Method: http.MethodPost, RootURL: o.fs.uploadURL, Path: o.uploadPath(), Parameters: url.Values{"action": {"save"}, "lastupdate": {"true"}, "acceptasynchronous": {"true"}}, Body: http.NoBody, ContentLength: &zero, ContentRange: fmt.Sprintf("bytes */%d", size), IgnoreStatus: true, NoResponse: true, ExtraHeaders: map[string]string{"X-funambol-id": string(o.info.ID), "X-funambol-file-size": strconv.FormatInt(size, 10)}}
 	var offset int64
 	err := o.fs.pacer.Call(func() (bool, error) {
 		for attempt := range maxAuthAttempts {
