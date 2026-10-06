@@ -380,8 +380,9 @@ func (a *auth) prepare(ctx context.Context) (authState, error) {
 			return authState{}, err
 		}
 
-		// Some providers delegate refresh to SAPI and do not expose client credentials.
-		if !token.Valid() && c.ClientID != "" && c.Endpoint.TokenURL != "" {
+		// SAPI renews credentials returned in its Authorization header.
+		credentials, _ := a.m.Get(credentialsKey)
+		if !token.Valid() && credentials == "" && c.ClientID != "" && c.Endpoint.TokenURL != "" {
 			tokenCtx := context.WithValue(ctx, oauth2.HTTPClient, a.httpClient)
 			token, err = c.TokenSource(tokenCtx, token).Token()
 			if err != nil {
