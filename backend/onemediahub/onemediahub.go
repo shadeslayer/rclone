@@ -155,7 +155,7 @@ func init() {
 			},
 			{
 				Name:     "metadata_cache",
-				Help:     "Cache account metadata and refresh it using the changes API. Persists in rclone's cache directory on supported systems. Requires /profile and /profile/changes support.",
+				Help:     "Cache account metadata and refresh it using the changes API. Enables mount change notifications. Persists in rclone's cache directory on supported systems. Requires /profile and /profile/changes support.",
 				Default:  false,
 				Advanced: true,
 			},
@@ -362,6 +362,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		pacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant)))}
 	f.auth = &auth{name: name, opt: opt, m: m, srv: srv, httpClient: client}
 	f.features = (&fs.Features{CanHaveEmptyDirectories: true}).Fill(ctx, f)
+	if !opt.MetadataCache {
+		f.features.ChangeNotify = nil
+	}
 	f.dirCache = dircache.New(f.root, opt.RootFolderID, f)
 	keepFs := false
 	defer func() {
@@ -782,6 +785,10 @@ func (f *Fs) changes(ctx context.Context, anchor int64) (map[string]api.Changes,
 }
 
 func (f *Fs) syncMetadata(ctx context.Context) error {
+	return f.updateMetadata(ctx, false)
+}
+
+func (f *Fs) updateMetadata(ctx context.Context, force bool) error {
 	c := f.metadata
 	if c == nil {
 		return nil
@@ -789,6 +796,9 @@ func (f *Fs) syncMetadata(ctx context.Context) error {
 	c.refreshMu.Lock()
 	defer c.refreshMu.Unlock()
 	c.mu.Lock()
+	if force {
+		c.checked = time.Time{}
+	}
 	foldersChanged, err := f.refreshMetadata(ctx)
 	c.mu.Unlock()
 	// FindLeaf reads metadata while dircache holds its lock.
@@ -1270,6 +1280,173 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) e
 		return err
 	}
 	return helper.Flush()
+}
+
+type notificationKey struct {
+	id   api.ID
+	kind fs.EntryType
+}
+
+type notificationEntry struct {
+	remote, version, status string
+	size, modified, date    int64
+}
+
+func (f *Fs) notificationState(ctx context.Context) (map[notificationKey]notificationEntry, error) {
+	c := f.metadata
+	c.mu.Lock()
+	folders := slices.Clone(c.state.Folders)
+	items := slices.Collect(maps.Values(c.state.Media))
+	c.mu.Unlock()
+	return f.notificationEntries(ctx, folders, items)
+}
+
+func (f *Fs) notificationEntries(ctx context.Context, folders []api.Folder, items []api.Media) (map[notificationKey]notificationEntry, error) {
+	paths, err := f.folderPaths(ctx, folders, api.ID(f.opt.RootFolderID), "")
+	if err != nil {
+		return nil, err
+	}
+	relative := func(remote string) (string, bool) {
+		if f.root == "" {
+			return remote, true
+		}
+		if remote == f.root {
+			return "", true
+		}
+		return strings.CutPrefix(remote, f.root+"/")
+	}
+	entries := make(map[notificationKey]notificationEntry, len(folders)+len(items))
+	for _, folder := range folders {
+		remote, found := paths[folder.ID]
+		if !found || folder.SoftDeleted || folder.Status == statusDeleted {
+			continue
+		}
+		if remote, found = relative(remote); found {
+			entries[notificationKey{folder.ID, fs.EntryDirectory}] = notificationEntry{remote: remote, date: folder.Date, status: folder.Status}
+		}
+	}
+	for _, item := range items {
+		parent := item.FolderID
+		if parent == "0" {
+			parent = ""
+		}
+		remote, found := paths[parent]
+		if !found || item.SoftDeleted || item.Status == statusDeleted {
+			continue
+		}
+		if remote, found = relative(path.Join(remote, f.opt.Enc.ToStandardName(item.Name))); found {
+			entries[notificationKey{item.ID, fs.EntryObject}] = notificationEntry{remote: remote, version: item.ETag, status: item.Status, size: item.Size, modified: item.Modified, date: item.Date}
+		}
+	}
+	return entries, nil
+}
+
+// ChangeNotify polls committed metadata changes when metadata_cache is enabled.
+func (f *Fs) ChangeNotify(ctx context.Context, notify func(string, fs.EntryType), intervals <-chan time.Duration) {
+	c := f.metadata
+	if c == nil || ctx.Err() != nil {
+		return
+	}
+	c.mu.Lock()
+	initialFolders := slices.Clone(c.state.Folders)
+	initialItems := slices.Collect(maps.Values(c.state.Media))
+	c.mu.Unlock()
+	ctx, cancel := context.WithCancel(ctx)
+	go func() {
+		defer cancel()
+		type result struct {
+			entries map[notificationKey]notificationEntry
+			err     error
+		}
+		results := make(chan result, 1)
+		var baseline map[notificationKey]notificationEntry
+		polling := false
+		start := func(refresh bool) {
+			polling = true
+			go func() {
+				var item result
+				if refresh {
+					item.err = f.updateMetadata(ctx, true)
+					if item.err == nil {
+						item.entries, item.err = f.notificationState(ctx)
+					}
+				} else {
+					item.entries, item.err = f.notificationEntries(ctx, initialFolders, initialItems)
+					initialFolders, initialItems = nil, nil
+				}
+				select {
+				case results <- item:
+				case <-ctx.Done():
+				}
+			}()
+		}
+		// Keep a separate baseline because foreground requests can refresh the cache.
+		start(false)
+		var ticker *time.Ticker
+		var ticks <-chan time.Time
+		defer func() {
+			if ticker != nil {
+				ticker.Stop()
+			}
+		}()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case interval, open := <-intervals:
+				if !open {
+					return
+				}
+				if ticker != nil {
+					ticker.Stop()
+					ticks = nil
+				}
+				if interval > 0 {
+					ticker = time.NewTicker(interval)
+					ticks = ticker.C
+				}
+			case <-ticks:
+				if !polling {
+					start(true)
+				}
+			case item := <-results:
+				polling = false
+				if item.err != nil {
+					if ctx.Err() == nil {
+						fs.Errorf(f, "ChangeNotify: %v", item.err)
+					}
+					continue
+				}
+				type changedPath struct {
+					remote string
+					kind   fs.EntryType
+				}
+				changed := map[changedPath]struct{}{}
+				if baseline != nil {
+					for key, old := range baseline {
+						if next, found := item.entries[key]; !found || old != next {
+							changed[changedPath{old.remote, key.kind}] = struct{}{}
+						}
+					}
+					for key, next := range item.entries {
+						if old, found := baseline[key]; !found || old != next {
+							changed[changedPath{next.remote, key.kind}] = struct{}{}
+						}
+					}
+				}
+				baseline = item.entries
+				paths := slices.Collect(maps.Keys(changed))
+				// Invalidate cached descendants before their old parent paths disappear.
+				slices.SortFunc(paths, func(a, b changedPath) int { return len(b.remote) - len(a.remote) })
+				for _, change := range paths {
+					if ctx.Err() != nil {
+						return
+					}
+					notify(change.remote, change.kind)
+				}
+			}
+		}
+	}()
 }
 
 // NewObject finds a file by its path, returning ErrorObjectNotFound if absent.
@@ -2079,5 +2256,6 @@ var (
 	_ fs.Shutdowner      = (*Fs)(nil)
 	_ fs.DirMover        = (*Fs)(nil)
 	_ fs.ListRer         = (*Fs)(nil)
+	_ fs.ChangeNotifier  = (*Fs)(nil)
 	_ dircache.DirCacher = (*Fs)(nil)
 )

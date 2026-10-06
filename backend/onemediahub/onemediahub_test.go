@@ -320,6 +320,260 @@ func TestListRCyclicFolders(t *testing.T) {
 	assert.ErrorContains(t, err, "repeats ID")
 }
 
+type changeNotification struct {
+	remote string
+	kind   fs.EntryType
+}
+
+func TestChangeNotify(t *testing.T) {
+	cacheDir := config.GetCacheDir()
+	require.NoError(t, config.SetCacheDir(t.TempDir()))
+	t.Cleanup(func() { require.NoError(t, config.SetCacheDir(cacheDir)) })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fx := newFixture(t)
+	fx.requestTime = 1700000000000
+	fx.folders = []api.Folder{{ID: "1", Name: "base"}, {ID: "2", ParentID: "1", Name: "child"}, {ID: "6", ParentID: "2", Name: "empty"}, {ID: "7", Name: "base-other"}}
+	fx.media = []api.Media{{ID: "3", FolderID: "2", Name: "old"}, {ID: "4", FolderID: "7", Name: "outside"}}
+	fx.changes = map[string]api.Changes{"file": {New: []api.ID{"3", "4"}}}
+	m := fx.config(t)
+	m["metadata_cache"] = "true"
+	remote, err := NewFs(ctx, "notify", "base", m)
+	require.NoError(t, err)
+	f := remote.(*Fs)
+	t.Cleanup(func() { require.NoError(t, f.Shutdown(context.Background())) })
+	require.NotNil(t, f.Features().ChangeNotify)
+	intervals := make(chan time.Duration)
+	defer close(intervals)
+	events := make(chan changeNotification, 64)
+	f.Features().ChangeNotify(ctx, func(remote string, kind fs.EntryType) {
+		_, err := f.List(ctx, "")
+		assert.NoError(t, err)
+		events <- changeNotification{remote, kind}
+	}, intervals)
+	intervals <- 25 * time.Millisecond
+	fx.mu.Lock()
+	fx.requestTime += 1000
+	fx.folders[1].Name = "renamed"
+	fx.media[0].Name = "new"
+	fx.media[1].Name = "ignored"
+	fx.changes = map[string]api.Changes{"folder": {Updated: []api.ID{"2"}}, "file": {Updated: []api.ID{"3", "4"}}}
+	fx.mu.Unlock()
+	receive := func(n int) []changeNotification {
+		t.Helper()
+		got := make([]changeNotification, 0, n)
+		for range n {
+			select {
+			case event := <-events:
+				got = append(got, event)
+			case <-time.After(3 * time.Second):
+				t.Fatal("timed out waiting for notifications")
+			}
+		}
+		return got
+	}
+	assert.ElementsMatch(t, []changeNotification{{"child", fs.EntryDirectory}, {"renamed", fs.EntryDirectory}, {"child/empty", fs.EntryDirectory}, {"renamed/empty", fs.EntryDirectory}, {"child/old", fs.EntryObject}, {"renamed/new", fs.EntryObject}}, receive(6))
+	intervals <- 0
+	// Let an already running request finish before checking that polling is paused.
+	time.Sleep(75 * time.Millisecond)
+	fx.mu.Lock()
+	paused := fx.requests["/sapi/profile/changes"]
+	fx.mu.Unlock()
+	time.Sleep(75 * time.Millisecond)
+	fx.mu.Lock()
+	assert.Equal(t, paused, fx.requests["/sapi/profile/changes"])
+	fx.requestTime += 1000
+	fx.media[0].Name = "third"
+	fx.changes = map[string]api.Changes{"file": {Updated: []api.ID{"3"}}}
+	fx.mu.Unlock()
+	// A foreground refresh must not consume the notifier's changes.
+	f.expireMetadata()
+	_, err = f.NewObject(ctx, "renamed/third")
+	require.NoError(t, err)
+	intervals <- 25 * time.Millisecond
+	assert.ElementsMatch(t, []changeNotification{{"renamed/new", fs.EntryObject}, {"renamed/third", fs.EntryObject}}, receive(2))
+	fx.mu.Lock()
+	fx.requestTime += 1000
+	fx.changeData = map[string]any{"folder": map[string]any{"S": []api.ID{"2"}}, "file": map[string]any{"S": []api.ID{"3"}}}
+	fx.mu.Unlock()
+	assert.ElementsMatch(t, []changeNotification{{"renamed", fs.EntryDirectory}, {"renamed/empty", fs.EntryDirectory}, {"renamed/third", fs.EntryObject}}, receive(3))
+}
+
+func TestChangeNotifyIntervalDuringRequest(t *testing.T) {
+	cacheDir := config.GetCacheDir()
+	require.NoError(t, config.SetCacheDir(t.TempDir()))
+	t.Cleanup(func() { require.NoError(t, config.SetCacheDir(cacheDir)) })
+	fx := newFixture(t)
+	fx.requestTime = 1700000000000
+	fx.changes = map[string]api.Changes{}
+	var block atomic.Bool
+	started, stopped := make(chan struct{}, 1), make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if block.Load() && r.URL.Path == "/sapi/profile/changes" {
+			started <- struct{}{}
+			<-r.Context().Done()
+			stopped <- struct{}{}
+			return
+		}
+		fx.serve(t, w, r)
+	}))
+	defer server.Close()
+	m := fx.config(t)
+	m["url"], m["metadata_cache"] = server.URL, "true"
+	remote, err := NewFs(context.Background(), "notify-blocked", "", m)
+	require.NoError(t, err)
+	f := remote.(*Fs)
+	t.Cleanup(func() { require.NoError(t, f.Shutdown(context.Background())) })
+	require.NotNil(t, f.Features().ChangeNotify)
+	intervals := make(chan time.Duration)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.Features().ChangeNotify(ctx, func(string, fs.EntryType) { t.Error("unexpected notification") }, intervals)
+	block.Store(true)
+	select {
+	case intervals <- 10 * time.Millisecond:
+	case <-time.After(time.Second):
+		t.Fatal("initial interval was not accepted")
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("poll did not start")
+	}
+	select {
+	case intervals <- 0:
+	case <-time.After(time.Second):
+		t.Fatal("interval update blocked behind request")
+	}
+	close(intervals)
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("channel closure did not cancel request")
+	}
+}
+
+func TestChangeNotifyFailedRefresh(t *testing.T) {
+	cacheDir := config.GetCacheDir()
+	require.NoError(t, config.SetCacheDir(t.TempDir()))
+	t.Cleanup(func() { require.NoError(t, config.SetCacheDir(cacheDir)) })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fx := newFixture(t)
+	fx.requestTime = 1700000000000
+	fx.media = []api.Media{{ID: "1", Name: "old"}}
+	fx.changes = map[string]api.Changes{"file": {New: []api.ID{"1"}}}
+	m := fx.config(t)
+	m["metadata_cache"] = "true"
+	remote, err := NewFs(ctx, "notify-failure", "", m)
+	require.NoError(t, err)
+	f := remote.(*Fs)
+	t.Cleanup(func() { require.NoError(t, f.Shutdown(context.Background())) })
+	intervals := make(chan time.Duration)
+	defer close(intervals)
+	events := make(chan changeNotification, 8)
+	f.ChangeNotify(ctx, func(remote string, kind fs.EntryType) { events <- changeNotification{remote, kind} }, intervals)
+	intervals <- 25 * time.Millisecond
+	require.Eventually(t, func() bool {
+		fx.mu.Lock()
+		defer fx.mu.Unlock()
+		return fx.requests["/sapi/profile/changes"] >= 2
+	}, time.Second, time.Millisecond)
+	fx.mu.Lock()
+	before := fx.requests["/sapi/media"]
+	fx.media[0].Name = "new"
+	fx.requestTime += 1000
+	fx.changes = map[string]api.Changes{"file": {Updated: []api.ID{"1"}}}
+	fx.failMedia = true
+	fx.mu.Unlock()
+	require.Eventually(t, func() bool {
+		fx.mu.Lock()
+		defer fx.mu.Unlock()
+		return fx.requests["/sapi/media"] > before
+	}, time.Second, time.Millisecond)
+	f.metadata.mu.Lock()
+	assert.EqualValues(t, 1700000000000, f.metadata.state.Anchor)
+	f.metadata.mu.Unlock()
+	select {
+	case event := <-events:
+		t.Fatalf("failed refresh emitted notification: %+v", event)
+	default:
+	}
+	fx.mu.Lock()
+	fx.failMedia = false
+	fx.mu.Unlock()
+	var got []changeNotification
+	for range 2 {
+		select {
+		case event := <-events:
+			got = append(got, event)
+		case <-time.After(time.Second):
+			t.Fatal("successful retry lost change notifications")
+		}
+	}
+	assert.ElementsMatch(t, []changeNotification{{"old", fs.EntryObject}, {"new", fs.EntryObject}}, got)
+}
+
+func TestChangeNotifyStartsBeforeLocalWrites(t *testing.T) {
+	cacheDir := config.GetCacheDir()
+	require.NoError(t, config.SetCacheDir(t.TempDir()))
+	t.Cleanup(func() { require.NoError(t, config.SetCacheDir(cacheDir)) })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fx := newFixture(t)
+	fx.requestTime = 1700000000000
+	fx.media = []api.Media{{ID: "1", Name: "old"}}
+	fx.changes = map[string]api.Changes{"file": {New: []api.ID{"1"}}}
+	m := fx.config(t)
+	m["metadata_cache"] = "true"
+	remote, err := NewFs(ctx, "notify-startup", "", m)
+	require.NoError(t, err)
+	f := remote.(*Fs)
+	t.Cleanup(func() { require.NoError(t, f.Shutdown(context.Background())) })
+	intervals := make(chan time.Duration)
+	defer close(intervals)
+	events := make(chan changeNotification, 8)
+	registered, accepted := make(chan struct{}), make(chan struct{})
+	f.metadata.mu.Lock()
+	go func() {
+		f.ChangeNotify(ctx, func(remote string, kind fs.EntryType) { events <- changeNotification{remote, kind} }, intervals)
+		close(registered)
+	}()
+	go func() { intervals <- 25 * time.Millisecond; close(accepted) }()
+	select {
+	case <-accepted:
+		t.Error("initial interval acknowledged before the baseline could be captured")
+	case <-time.After(50 * time.Millisecond):
+	}
+	f.metadata.mu.Unlock()
+	<-registered
+	<-accepted
+	f.cacheMedia(api.Media{ID: "1", Name: "new"}, false)
+	fx.mu.Lock()
+	fx.media[0].Name = "new"
+	fx.changes = map[string]api.Changes{}
+	fx.mu.Unlock()
+	var got []changeNotification
+	for range 2 {
+		select {
+		case event := <-events:
+			got = append(got, event)
+		case <-time.After(time.Second):
+			t.Fatal("local write after registration was not reported")
+		}
+	}
+	assert.ElementsMatch(t, []changeNotification{{"old", fs.EntryObject}, {"new", fs.EntryObject}}, got)
+}
+
+func TestChangeNotifyDisabled(t *testing.T) {
+	fx := newFixture(t)
+	remote, err := NewFs(context.Background(), "notify-disabled", "", fx.config(t))
+	require.NoError(t, err)
+	f := remote.(*Fs)
+	t.Cleanup(func() { require.NoError(t, f.Shutdown(context.Background())) })
+	assert.Nil(t, f.Features().ChangeNotify)
+}
+
 func TestDirMove(t *testing.T) {
 	for _, cached := range []bool{false, true} {
 		t.Run(strconv.FormatBool(cached), func(t *testing.T) {
