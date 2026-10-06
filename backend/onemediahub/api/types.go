@@ -56,10 +56,11 @@ func (e *Error) Error() string { return e.Code + ": " + e.Message }
 
 // Response contains the common response envelope.
 type Response struct {
-	Data  json.RawMessage `json:"data"`  // Data contains the operation result.
-	Error *Error          `json:"error"` // Error contains a failure, if any.
-	ID    ID              `json:"id"`    // ID identifies a saved item or folder.
-	More  bool            `json:"more"`  // More indicates another media page.
+	RequestTime json.Number     `json:"requesttime"` // RequestTime is the server response time in milliseconds.
+	Data        json.RawMessage `json:"data"`        // Data contains the operation result.
+	Error       *Error          `json:"error"`       // Error contains a failure, if any.
+	ID          ID              `json:"id"`          // ID identifies a saved item or folder.
+	More        bool            `json:"more"`        // More indicates another media page.
 }
 
 // Session contains the credentials for a SAPI session.
@@ -76,6 +77,14 @@ type Folder struct {
 	Date        int64  `json:"date,omitempty"`        // Date is the server update time in milliseconds.
 	Status      string `json:"status,omitempty"`      // Status is the server item status.
 	SoftDeleted bool   `json:"softdeleted,omitempty"` // SoftDeleted indicates a trashed folder.
+}
+
+// Changes contains changed item IDs grouped by their server status.
+type Changes struct {
+	New     []ID `json:"N,omitempty"` // New identifies added items.
+	Updated []ID `json:"U,omitempty"` // Updated identifies modified items.
+	Deleted []ID `json:"D,omitempty"` // Deleted identifies removed items.
+	Locked  []ID `json:"L,omitempty"` // Locked identifies items being processed.
 }
 
 // Media describes a stored object.

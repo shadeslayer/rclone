@@ -19,6 +19,7 @@ import (
 
 	"github.com/rclone/rclone/backend/onemediahub/api"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/obscure"
 	"github.com/rclone/rclone/fs/object"
@@ -47,6 +48,266 @@ func jsonReply(t *testing.T, w http.ResponseWriter, value any) {
 	t.Helper()
 	w.Header().Set("Content-Type", "application/json")
 	assert.NoError(t, json.NewEncoder(w).Encode(value))
+}
+
+func TestMetadataCache(t *testing.T) {
+	cacheDir := config.GetCacheDir()
+	require.NoError(t, config.SetCacheDir(t.TempDir()))
+	t.Cleanup(func() { require.NoError(t, config.SetCacheDir(cacheDir)) })
+	ctx := context.Background()
+	fx := newFixture(t)
+	fx.requestTime = 1700000000123
+	fx.folders = []api.Folder{{ID: "1", Name: "directory", Status: "U"}}
+	fx.media = []api.Media{{ID: "2", FolderID: "1", Name: "old.txt", Size: 3, Type: "file"}}
+	fx.changes = map[string]api.Changes{"folder": {New: []api.ID{"1"}}, "file": {New: []api.ID{"2"}}}
+	m := testConfig(t, configmap.Simple{"url": fx.server.URL, "auth_type": authPassword, "user": "alice", "password": obscure.MustObscure("password"), "metadata_cache": "true"})
+	remote, err := NewFs(ctx, "metadata-test", "", m)
+	require.NoError(t, err)
+	f := remote.(*Fs)
+	t.Cleanup(func() { require.NoError(t, f.Shutdown(ctx)) })
+	var wg sync.WaitGroup
+	for range 12 {
+		wg.Go(func() {
+			obj, err := f.NewObject(ctx, "directory/old.txt")
+			assert.NoError(t, err)
+			if obj != nil {
+				assert.EqualValues(t, 3, obj.Size())
+			}
+		})
+	}
+	wg.Wait()
+	fx.mu.Lock()
+	assert.Equal(t, 1, fx.requests["/sapi/profile/changes"])
+	assert.Equal(t, 1, fx.requests["/sapi/media"])
+	assert.Equal(t, 1, fx.requests["/sapi/media/folder"])
+	fx.requestTime += 60000
+	fx.folders[0].Name = "renamed"
+	fx.media = []api.Media{{ID: "3", FolderID: "1", Name: "new.txt", Size: 7, Type: "file"}}
+	fx.changes = map[string]api.Changes{"folder": {Updated: []api.ID{"1"}}, "file": {New: []api.ID{"3"}, Deleted: []api.ID{"2"}}}
+	fx.mu.Unlock()
+	f.metadata.mu.Lock()
+	f.metadata.checked = time.Time{}
+	f.metadata.mu.Unlock()
+	for range 12 {
+		wg.Go(func() {
+			_, err := f.NewObject(ctx, "directory/old.txt")
+			assert.ErrorIs(t, err, fs.ErrorObjectNotFound)
+			_, err = f.NewObject(ctx, "renamed/new.txt")
+			assert.NoError(t, err)
+		})
+	}
+	wg.Wait()
+	obj, err := f.NewObject(ctx, "renamed/new.txt")
+	require.NoError(t, err)
+	assert.EqualValues(t, 7, obj.Size())
+
+	// A failed metadata fetch must leave the saved change cursor unchanged.
+	fx.mu.Lock()
+	fx.requestTime += 60000
+	fx.media[0].Size = 9
+	fx.changes = map[string]api.Changes{"file": {Updated: []api.ID{"3"}}}
+	fx.failMedia = true
+	fx.mu.Unlock()
+	f.metadata.mu.Lock()
+	f.metadata.checked = time.Time{}
+	anchor := f.metadata.state.Anchor
+	f.metadata.mu.Unlock()
+	_, err = f.NewObject(ctx, "renamed/new.txt")
+	require.ErrorContains(t, err, "failed metadata")
+	assert.Equal(t, anchor, f.metadata.state.Anchor)
+	fx.mu.Lock()
+	fx.failMedia = false
+	fx.mu.Unlock()
+	obj, err = f.NewObject(ctx, "renamed/new.txt")
+	require.NoError(t, err)
+	assert.EqualValues(t, 9, obj.Size())
+
+	// Download lookups must not rewrite comparison metadata outside a changes refresh.
+	fx.mu.Lock()
+	fx.media[0].Name = "download-name.txt"
+	fx.media[0].URL = fx.server.URL + "/content/3"
+	fx.content["3"] = "123456789"
+	fx.mu.Unlock()
+	body, err := obj.Open(ctx)
+	require.NoError(t, err)
+	contentBytes, err := io.ReadAll(body)
+	require.NoError(t, err)
+	require.NoError(t, body.Close())
+	assert.Equal(t, "123456789", string(contentBytes))
+	_, err = f.NewObject(ctx, "renamed/new.txt")
+	require.NoError(t, err)
+	fx.mu.Lock()
+	fx.media[0].Name = "new.txt"
+	fx.mu.Unlock()
+
+	// A second filesystem reads the persisted snapshot and applies only changes.
+	fx.mu.Lock()
+	fx.changes = map[string]api.Changes{}
+	folderRequests := fx.requests["/sapi/media/folder"]
+	mediaRequests := fx.requests["/sapi/media"]
+	fx.mu.Unlock()
+	restarted, err := NewFs(ctx, "metadata-test", "", m)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, restarted.(*Fs).Shutdown(ctx)) })
+	obj, err = restarted.NewObject(ctx, "renamed/new.txt")
+	require.NoError(t, err)
+	assert.EqualValues(t, 9, obj.Size())
+	fx.mu.Lock()
+	assert.Equal(t, folderRequests, fx.requests["/sapi/media/folder"])
+	assert.Equal(t, mediaRequests, fx.requests["/sapi/media"])
+	fx.mu.Unlock()
+
+	// Local writes must be visible before the next changes poll.
+	fx.mu.Lock()
+	fx.nextID = 10
+	fx.mu.Unlock()
+	content := "cached upload"
+	src := object.NewStaticObjectInfo("created/file.txt", time.Now(), int64(len(content)), true, nil, f)
+	uploaded, err := f.Put(ctx, strings.NewReader(content), src)
+	require.NoError(t, err)
+	listed, err := f.List(ctx, "created")
+	require.NoError(t, err)
+	require.Len(t, listed, 1)
+	found, err := f.NewObject(ctx, src.Remote())
+	require.NoError(t, err)
+	assert.Equal(t, uploaded.(*Object).ID(), found.(*Object).ID())
+	require.NoError(t, uploaded.Remove(ctx))
+	_, err = f.NewObject(ctx, src.Remote())
+	assert.ErrorIs(t, err, fs.ErrorObjectNotFound)
+	require.NoError(t, f.Rmdir(ctx, "created"))
+
+	// Directory removal must check external changes even within the cache interval.
+	require.NoError(t, f.Mkdir(ctx, "external"))
+	parent, err := f.dirCache.FindDir(ctx, "external", false)
+	require.NoError(t, err)
+	fx.mu.Lock()
+	fx.media = append(fx.media, api.Media{ID: "99", FolderID: api.ID(parent), Name: "external.txt", Size: 1, Type: "file"})
+	fx.changes = map[string]api.Changes{"file": {New: []api.ID{"99"}}}
+	fx.mu.Unlock()
+	assert.ErrorIs(t, f.Rmdir(ctx, "external"), fs.ErrorDirectoryNotEmpty)
+}
+
+func TestMetadataCacheDeletedRoot(t *testing.T) {
+	cacheDir := config.GetCacheDir()
+	require.NoError(t, config.SetCacheDir(t.TempDir()))
+	t.Cleanup(func() { require.NoError(t, config.SetCacheDir(cacheDir)) })
+	ctx := context.Background()
+	fx := newFixture(t)
+	fx.requestTime = 1700000000123
+	fx.folders = []api.Folder{{ID: "1", Name: "root"}}
+	fx.media = []api.Media{{ID: "2", FolderID: "1", Name: "file", Type: "file"}}
+	fx.changes = map[string]api.Changes{"folder": {New: []api.ID{"1"}}, "file": {New: []api.ID{"2"}}}
+	m := fx.config(t)
+	m["metadata_cache"] = "true"
+	m["root_folder_id"] = "1"
+	remote, err := NewFs(ctx, "deleted-root-test", "", m)
+	require.NoError(t, err)
+	f := remote.(*Fs)
+	t.Cleanup(func() { require.NoError(t, f.Shutdown(ctx)) })
+	_, err = f.NewObject(ctx, "file")
+	require.NoError(t, err)
+	fx.mu.Lock()
+	fx.folders = nil
+	fx.changes = map[string]api.Changes{"folder": {Deleted: []api.ID{"1"}}}
+	fx.mu.Unlock()
+	f.metadata.mu.Lock()
+	f.metadata.checked = time.Time{}
+	f.metadata.mu.Unlock()
+	_, err = f.NewObject(ctx, "file")
+	assert.ErrorIs(t, err, fs.ErrorObjectNotFound)
+}
+
+func TestMetadataCachePendingAndBatching(t *testing.T) {
+	cacheDir := config.GetCacheDir()
+	require.NoError(t, config.SetCacheDir(t.TempDir()))
+	t.Cleanup(func() { require.NoError(t, config.SetCacheDir(cacheDir)) })
+	ctx := context.Background()
+	fx := newFixture(t)
+	fx.requestTime = 1700000000123
+	change := api.Changes{Locked: []api.ID{"999"}}
+	fx.media = append(fx.media, api.Media{ID: "999", Name: "locked", Status: "L", Type: "file"})
+	for i := 1; i <= pageSize+1; i++ {
+		id := api.ID(strconv.Itoa(i))
+		change.New = append(change.New, id)
+		if i > 1 {
+			fx.media = append(fx.media, api.Media{ID: id, Name: "file" + string(id), Size: 1, Type: "file"})
+		}
+	}
+	fx.changes = map[string]api.Changes{"file": change}
+	m := fx.config(t)
+	m["metadata_cache"] = "true"
+	remote, err := NewFs(ctx, "pending-test", "", m)
+	require.NoError(t, err)
+	f := remote.(*Fs)
+	t.Cleanup(func() { require.NoError(t, f.Shutdown(ctx)) })
+	assert.ElementsMatch(t, []int{pageSize, 2}, fx.mediaBatches)
+	assert.ElementsMatch(t, []api.ID{"1", "999"}, f.metadata.state.Pending)
+	assert.Equal(t, "19700101T000000Z", fx.changesFrom[0])
+	anchor := f.metadata.state.Anchor
+	fx.mu.Lock()
+	fx.media = append(fx.media, api.Media{ID: "1", Name: "ready", Size: 5, Type: "file"})
+	fx.requestTime += 60000
+	fx.changes = map[string]api.Changes{}
+	fx.mu.Unlock()
+	f.metadata.mu.Lock()
+	f.metadata.checked = time.Time{}
+	f.metadata.mu.Unlock()
+	obj, err := f.NewObject(ctx, "ready")
+	require.NoError(t, err)
+	assert.EqualValues(t, 5, obj.Size())
+	assert.Equal(t, []api.ID{"999"}, f.metadata.state.Pending)
+	assert.Equal(t, time.UnixMilli(anchor).Add(-time.Second).UTC().Format(dateFormat), fx.changesFrom[1])
+	assert.Equal(t, 2, fx.mediaBatches[2])
+	fx.mu.Lock()
+	fx.requestTime += 60000
+	fx.changes = map[string]api.Changes{"file": {Deleted: []api.ID{"999"}}}
+	fx.mu.Unlock()
+	f.metadata.mu.Lock()
+	f.metadata.checked = time.Time{}
+	f.metadata.mu.Unlock()
+	_, err = f.List(ctx, "")
+	require.NoError(t, err)
+	assert.Empty(t, f.metadata.state.Pending)
+
+	// Reconnecting the same remote to another account must start a new snapshot.
+	fx.mu.Lock()
+	fx.accountID = "another-account"
+	fx.media = nil
+	fx.changes = map[string]api.Changes{}
+	fx.mu.Unlock()
+	other, err := NewFs(ctx, "pending-test", "", m)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, other.(*Fs).Shutdown(ctx)) })
+	_, err = other.NewObject(ctx, "ready")
+	assert.ErrorIs(t, err, fs.ErrorObjectNotFound)
+	assert.Equal(t, "19700101T000000Z", fx.changesFrom[3])
+}
+
+func TestMetadataCacheInvalidChanges(t *testing.T) {
+	cacheDir := config.GetCacheDir()
+	require.NoError(t, config.SetCacheDir(t.TempDir()))
+	t.Cleanup(func() { require.NoError(t, config.SetCacheDir(cacheDir)) })
+	for _, tc := range []struct {
+		name      string
+		timestamp int64
+		data      any
+		want      string
+	}{
+		{"MissingTime", 0, map[string]any{}, "invalid requesttime"},
+		{"UnknownSource", 1700000000123, map[string]any{"unexpected": map[string]any{}}, "unsupported source"},
+		{"UnknownStatus", 1700000000123, map[string]any{"file": map[string]any{"X": []int{1}}}, "unsupported status"},
+		{"InvalidID", 1700000000123, map[string]any{"file": map[string]any{"N": []string{"invalid"}}}, "invalid changes"},
+		{"MissingData", 1700000000123, nil, "invalid changes"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newFixture(t)
+			fx.requestTime, fx.changeData = tc.timestamp, tc.data
+			m := fx.config(t)
+			m["metadata_cache"] = "true"
+			_, err := NewFs(context.Background(), "invalid-test", "", m)
+			require.ErrorContains(t, err, tc.want)
+		})
+	}
 }
 
 func TestSessionRenewal(t *testing.T) {
@@ -312,6 +573,14 @@ type fixture struct {
 	content      map[api.ID]string
 	nextID       int
 	server       *httptest.Server
+	changes      map[string]api.Changes
+	requestTime  int64
+	requests     map[string]int
+	failMedia    bool
+	changesFrom  []string
+	mediaBatches []int
+	accountID    string
+	changeData   any
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -325,6 +594,10 @@ func newFixture(t *testing.T) *fixture {
 func (fx *fixture) serve(t *testing.T, w http.ResponseWriter, r *http.Request) {
 	fx.mu.Lock()
 	defer fx.mu.Unlock()
+	if fx.requests == nil {
+		fx.requests = map[string]int{}
+	}
+	fx.requests[r.URL.Path]++
 	if fx.mode == o2Mode && r.URL.Query().Get("offset") == "0" {
 		jsonReply(t, w, map[string]any{"error": map[string]string{"code": "COM-1021", "message": "Invalid offset"}})
 		return
@@ -357,6 +630,27 @@ func (fx *fixture) serve(t *testing.T, w http.ResponseWriter, r *http.Request) {
 	}
 	action := r.URL.Query().Get("action")
 	switch {
+	case r.URL.Path == "/sapi/profile":
+		id := fx.accountID
+		if id == "" {
+			id = "test-account"
+		}
+		jsonReply(t, w, map[string]any{"data": map[string]any{"user": map[string]any{"generic": map[string]string{"userid": id}}}})
+	case r.URL.Path == "/sapi/profile/changes":
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "folder,file,picture,video,audio", r.URL.Query().Get("type"))
+		assert.Equal(t, "true", r.URL.Query().Get("responsetime"))
+		assert.Equal(t, "true", r.URL.Query().Get("locked"))
+		assert.Equal(t, "creationdate", r.URL.Query().Get("sortby"))
+		assert.Equal(t, "descending", r.URL.Query().Get("sortorder"))
+		_, err := time.Parse(dateFormat, r.URL.Query().Get("from"))
+		assert.NoError(t, err)
+		fx.changesFrom = append(fx.changesFrom, r.URL.Query().Get("from"))
+		data := fx.changeData
+		if data == nil {
+			data = fx.changes
+		}
+		jsonReply(t, w, map[string]any{"data": data, "requesttime": strconv.FormatInt(fx.requestTime, 10)})
 	case r.URL.Path == "/sapi/media/folder" && action == "get":
 		assert.Equal(t, http.MethodGet, r.Method)
 		offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
@@ -398,6 +692,10 @@ func (fx *fixture) serve(t *testing.T, w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	case r.URL.Path == "/sapi/media" && action == "get":
+		if fx.failMedia {
+			jsonReply(t, w, map[string]any{"error": map[string]string{"code": "COM-1011", "message": "failed metadata"}})
+			return
+		}
 		assert.Equal(t, http.MethodPost, r.Method)
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&envelope))
 		var data struct {
@@ -406,6 +704,7 @@ func (fx *fixture) serve(t *testing.T, w http.ResponseWriter, r *http.Request) {
 		}
 		require.NoError(t, json.Unmarshal(envelope.Data, &data))
 		assert.Subset(t, data.Fields, []string{"name", "size", "modificationdate", "url", "folderid"})
+		fx.mediaBatches = append(fx.mediaBatches, len(data.IDs))
 		items := fx.media
 		more := false
 		if data.IDs != nil {
@@ -1219,6 +1518,28 @@ func TestAPIErrors(t *testing.T) {
 	_, err = f.List(context.Background(), "")
 	require.ErrorContains(t, err, "COM-1011")
 	assert.EqualValues(t, 2, reads.Load())
+}
+
+func TestHTTPErrorContext(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://cloud.example.com/sapi/upload?action=save&validationkey=secret", nil)
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name    string
+		request *http.Request
+		body    string
+		want    string
+	}{
+		{name: "Request", request: req, body: "<html>secret</html>", want: `OneMediaHub HTTP error: 403 Forbidden (POST cloud.example.com/sapi/upload action="save")`},
+		{name: "NoRequest", body: "<html>secret</html>", want: "OneMediaHub HTTP error: 403 Forbidden"},
+		{name: "APIError", request: req, body: `{"error":{"code":"COM-1011","message":"Invalid request"}}`, want: "COM-1011: Invalid request"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := &http.Response{StatusCode: http.StatusForbidden, Status: "403 Forbidden", Request: tc.request, Body: io.NopCloser(strings.NewReader(tc.body))}
+			err := errorHandler(resp)
+			assert.EqualError(t, err, tc.want)
+			assert.NotContains(t, err.Error(), "secret")
+		})
+	}
 }
 
 func TestTokenResponse(t *testing.T) {

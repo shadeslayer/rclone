@@ -4,6 +4,7 @@ package onemediahub
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -18,6 +19,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -31,6 +33,7 @@ import (
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/kv"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
 )
@@ -143,6 +146,18 @@ func init() {
 				Advanced: true,
 			},
 			{
+				Name:     "metadata_cache",
+				Help:     "Cache account metadata and refresh it using the changes API. Persists in rclone's cache directory on supported systems. Requires /profile and /profile/changes support.",
+				Default:  false,
+				Advanced: true,
+			},
+			{
+				Name:     "metadata_cache_time",
+				Help:     "Interval between changes API refreshes. External changes may remain invisible until the next refresh; rclone writes update the cache immediately.",
+				Default:  fs.Duration(time.Minute),
+				Advanced: true,
+			},
+			{
 				Name:     "async_upload",
 				Help:     "Register metadata separately and upload raw content with asynchronous server processing instead of multipart uploads.",
 				Default:  false,
@@ -214,26 +229,28 @@ func init() {
 }
 
 type options struct {
-	URL           string               `config:"url"`
-	AuthType      string               `config:"auth_type"`
-	User          string               `config:"user"`
-	Password      string               `config:"password"`
-	ClientID      string               `config:"client_id"`
-	ClientSecret  string               `config:"client_secret"`
-	AuthURL       string               `config:"auth_url"`
-	TokenURL      string               `config:"token_url"`
-	RedirectURL   string               `config:"redirect_url"`
-	Scope         string               `config:"scope"`
-	Platform      string               `config:"platform"`
-	MSISDN        string               `config:"msisdn"`
-	DeviceID      string               `config:"device_id"`
-	UserAgent     string               `config:"user_agent"`
-	UploadURL     string               `config:"upload_url"`
-	AsyncUpload   bool                 `config:"async_upload"`
-	UploadTimeout fs.Duration          `config:"upload_timeout"`
-	APIPath       string               `config:"api_path"`
-	RootFolderID  string               `config:"root_folder_id"`
-	Enc           encoder.MultiEncoder `config:"encoding"`
+	URL               string               `config:"url"`
+	AuthType          string               `config:"auth_type"`
+	User              string               `config:"user"`
+	Password          string               `config:"password"`
+	ClientID          string               `config:"client_id"`
+	ClientSecret      string               `config:"client_secret"`
+	AuthURL           string               `config:"auth_url"`
+	TokenURL          string               `config:"token_url"`
+	RedirectURL       string               `config:"redirect_url"`
+	Scope             string               `config:"scope"`
+	Platform          string               `config:"platform"`
+	MSISDN            string               `config:"msisdn"`
+	DeviceID          string               `config:"device_id"`
+	UserAgent         string               `config:"user_agent"`
+	UploadURL         string               `config:"upload_url"`
+	AsyncUpload       bool                 `config:"async_upload"`
+	UploadTimeout     fs.Duration          `config:"upload_timeout"`
+	MetadataCache     bool                 `config:"metadata_cache"`      // MetadataCache enables account metadata caching.
+	MetadataCacheTime fs.Duration          `config:"metadata_cache_time"` // MetadataCacheTime is the interval between changes API refreshes.
+	APIPath           string               `config:"api_path"`
+	RootFolderID      string               `config:"root_folder_id"`
+	Enc               encoder.MultiEncoder `config:"encoding"`
 }
 
 func newClient(ctx context.Context, opt *options) *http.Client {
@@ -267,6 +284,9 @@ func readOptions(m configmap.Mapper) (*options, error) {
 	if opt.AsyncUpload && opt.UploadTimeout <= 0 {
 		return nil, errors.New("upload_timeout must be positive")
 	}
+	if opt.MetadataCache && opt.MetadataCacheTime <= 0 {
+		return nil, errors.New("metadata_cache_time must be positive")
+	}
 
 	if strings.ContainsAny(opt.APIPath, "?#") || strings.Contains(opt.APIPath, "://") {
 		return nil, errors.New("api_path must be a relative SAPI path")
@@ -292,6 +312,7 @@ type Fs struct {
 	auth      *auth
 	dirCache  *dircache.DirCache
 	pacer     *fs.Pacer
+	metadata  *metadataCache
 }
 
 // Object describes a OneMediaHub media item.
@@ -354,9 +375,21 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if _, err = f.auth.prepare(ctx); err != nil {
 		return nil, err
 	}
+	if opt.MetadataCache {
+		if err := f.startMetadataCache(ctx); err != nil {
+			return nil, fmt.Errorf("start metadata cache: %w", err)
+		}
+	}
+	keepCache := false
+	defer func() {
+		if !keepCache {
+			_ = f.Shutdown(ctx)
+		}
+	}()
 
 	err = f.dirCache.FindRoot(ctx, false)
 	if err == nil {
+		keepCache = true
 		return f, nil
 	}
 
@@ -369,10 +402,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	f.dirCache = dircache.New(parent, opt.RootFolderID, f)
 	_, err = f.NewObject(ctx, leaf)
 	if err == nil {
+		keepCache = true
 		return f, fs.ErrorIsFile
 	}
 	f.root, f.dirCache = originalRoot, originalCache
 	if errors.Is(err, fs.ErrorObjectNotFound) || errors.Is(err, fs.ErrorDirNotFound) {
+		keepCache = true
 		return f, nil
 	}
 	return nil, err
@@ -413,6 +448,9 @@ func errorHandler(resp *http.Response) error {
 	var reply api.Response
 	if err := rest.DecodeJSON(resp, &reply); err == nil && reply.Error != nil {
 		return reply.Error
+	}
+	if req := resp.Request; req != nil && req.URL != nil {
+		return fmt.Errorf("OneMediaHub HTTP error: %s (%s %s%s action=%q)", resp.Status, req.Method, req.URL.Host, req.URL.EscapedPath(), req.URL.Query().Get("action"))
 	}
 	return fmt.Errorf("OneMediaHub HTTP error: %s", resp.Status)
 }
@@ -525,7 +563,305 @@ func pageParams(offset int) url.Values {
 	return params
 }
 
+type metadataSnapshot struct {
+	Version int                  // Version identifies the cache format.
+	Anchor  int64                // Anchor is the last applied server response time in milliseconds.
+	Folders []api.Folder         // Folders contains account folders.
+	Media   map[api.ID]api.Media // Media indexes account files by ID.
+	Pending []api.ID             // Pending identifies locked or unavailable media to fetch again.
+}
+
+type metadataCache struct {
+	refreshMu sync.Mutex
+	mu        sync.Mutex
+	db        *kv.DB
+	state     *metadataSnapshot
+	checked   time.Time
+	byName    map[mediaKey]api.ID
+}
+
+type mediaKey struct {
+	parent string
+	name   string
+}
+
+func (f *Fs) mediaKey(item api.Media) mediaKey {
+	parent := string(item.FolderID)
+	if parent == "0" {
+		parent = ""
+	}
+	return mediaKey{parent: parent, name: f.opt.Enc.ToStandardName(item.Name)}
+}
+
+func (f *Fs) cacheMedia(item api.Media, remove bool) {
+	if c := f.metadata; c != nil {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if old, ok := c.state.Media[item.ID]; ok && (remove || f.mediaKey(old) != f.mediaKey(item)) {
+			key := f.mediaKey(old)
+			if c.byName[key] == item.ID {
+				delete(c.byName, key)
+				for id, other := range c.state.Media {
+					if id != item.ID && f.mediaKey(other) == key && id > c.byName[key] {
+						c.byName[key] = id
+					}
+				}
+			}
+		}
+		delete(c.state.Media, item.ID)
+		if !remove {
+			c.state.Media[item.ID] = item
+			key := f.mediaKey(item)
+			if item.ID >= c.byName[key] {
+				c.byName[key] = item.ID
+			}
+		}
+	}
+}
+
+func (f *Fs) cacheFolder(folder api.Folder, remove bool) {
+	if c := f.metadata; c != nil {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.state.Folders = slices.DeleteFunc(c.state.Folders, func(old api.Folder) bool { return old.ID == folder.ID })
+		if !remove {
+			c.state.Folders = append(c.state.Folders, folder)
+		}
+	}
+}
+
+type metadataOp struct {
+	state *metadataSnapshot
+	write bool
+}
+
+func (op *metadataOp) Do(_ context.Context, bucket kv.Bucket) error {
+	key := []byte("metadata")
+	if !op.write {
+		if b := bucket.Get(key); b != nil {
+			return json.Unmarshal(b, &op.state)
+		}
+		return nil
+	}
+	b, err := json.Marshal(op.state)
+	if err != nil {
+		return err
+	}
+	return bucket.Put(key, b)
+}
+
+func (f *Fs) startMetadataCache(ctx context.Context) error {
+	reply, err := f.request(ctx, http.MethodGet, "/profile", "get", nil, nil)
+	if err != nil {
+		return err
+	}
+	var profile struct {
+		User struct {
+			Generic struct {
+				ID string `json:"userid"`
+			} `json:"generic"`
+		} `json:"user"`
+	}
+	if err := json.Unmarshal(reply.Data, &profile); err != nil {
+		return err
+	}
+	if profile.User.Generic.ID == "" {
+		return errors.New("profile returned no account ID")
+	}
+	f.metadata = &metadataCache{}
+	if kv.Supported() {
+		// Token rotation must not change the account's cache namespace.
+		scope, _ := json.Marshal([]string{strings.TrimRight(f.opt.URL, "/"), f.opt.APIPath, profile.User.Generic.ID})
+		digest := sha256.Sum256(scope)
+		db, err := kv.Start(ctx, fmt.Sprintf("onemediahub-%x", digest[:]), f)
+		if err != nil {
+			return err
+		}
+		f.metadata.db = db
+		op := &metadataOp{}
+		if err := db.Do(false, op); err != nil && !errors.Is(err, kv.ErrEmpty) {
+			fs.Debugf(f, "Discarding unreadable metadata cache: %v", err)
+		} else if op.state != nil && op.state.Version == 1 && op.state.Anchor > 0 && op.state.Media != nil {
+			f.metadata.state = op.state
+			fs.Debugf(f, "Loaded metadata cache")
+		}
+	}
+	if err := f.syncMetadata(ctx); err != nil {
+		_ = f.Shutdown(ctx)
+		return err
+	}
+	return nil
+}
+
+func (f *Fs) changes(ctx context.Context, anchor int64) (map[string]api.Changes, int64, error) {
+	from := time.UnixMilli(anchor).UTC()
+	if anchor > 0 {
+		// SAPI dates have second precision, while requesttime has millisecond precision.
+		from = from.Add(-time.Second)
+	}
+	reply, err := f.request(ctx, http.MethodGet, "/profile/changes", "get", url.Values{
+		"from": {from.Format(dateFormat)}, "type": {"folder,file,picture,video,audio"}, "responsetime": {"true"},
+		"sortby": {"creationdate"}, "sortorder": {"descending"}, "locked": {"true"},
+	}, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	timestamp, err := reply.RequestTime.Int64()
+	if err != nil || timestamp <= 0 || timestamp < anchor {
+		return nil, 0, errors.New("changes API returned an invalid requesttime")
+	}
+	if reply.More {
+		return nil, 0, errors.New("changes API returned an incomplete result")
+	}
+	var raw map[string]map[string][]api.ID
+	if err := json.Unmarshal(reply.Data, &raw); err != nil || raw == nil {
+		return nil, 0, errors.New("changes API returned invalid changes")
+	}
+	for source, changes := range raw {
+		if !slices.Contains([]string{"folder", "file", "picture", "video", "audio"}, source) {
+			return nil, 0, fmt.Errorf("changes API returned unsupported source %q", source)
+		}
+		for status := range changes {
+			if !slices.Contains([]string{"N", "U", "D", "L"}, status) {
+				return nil, 0, fmt.Errorf("changes API returned unsupported status %q", status)
+			}
+		}
+	}
+	var changes map[string]api.Changes
+	if err := json.Unmarshal(reply.Data, &changes); err != nil {
+		return nil, 0, err
+	}
+	return changes, timestamp, nil
+}
+
+func (f *Fs) syncMetadata(ctx context.Context) error {
+	c := f.metadata
+	if c == nil {
+		return nil
+	}
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
+	c.mu.Lock()
+	foldersChanged, err := f.refreshMetadata(ctx)
+	c.mu.Unlock()
+	// FindLeaf reads metadata while dircache holds its lock.
+	if foldersChanged {
+		f.dirCache.ResetRoot()
+	}
+	return err
+}
+
+func (f *Fs) expireMetadata() {
+	if c := f.metadata; c != nil {
+		c.mu.Lock()
+		c.checked = time.Time{}
+		c.mu.Unlock()
+	}
+}
+
+// refreshMetadata runs with the metadata cache locked.
+func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
+	c := f.metadata
+	if !c.checked.IsZero() && time.Since(c.checked) < time.Duration(f.opt.MetadataCacheTime) {
+		return false, nil
+	}
+	next := &metadataSnapshot{Version: 1, Media: map[api.ID]api.Media{}}
+	if c.state != nil {
+		*next = *c.state
+		next.Media = maps.Clone(c.state.Media)
+	}
+	changes, timestamp, err := f.changes(ctx, next.Anchor)
+	if err != nil {
+		return false, err
+	}
+	folderChanges := changes["folder"]
+	foldersChanged := c.state == nil || len(folderChanges.New)+len(folderChanges.Updated)+len(folderChanges.Deleted)+len(folderChanges.Locked) > 0
+	if foldersChanged {
+		next.Folders, err = f.fetchFolders(ctx)
+		if err != nil {
+			return false, err
+		}
+	}
+	ids := map[api.ID]struct{}{}
+	locked := map[api.ID]struct{}{}
+	for _, id := range next.Pending {
+		ids[id] = struct{}{}
+	}
+	for source, change := range changes {
+		if source == "folder" {
+			continue
+		}
+		for _, id := range slices.Concat(change.New, change.Updated, change.Locked) {
+			ids[id] = struct{}{}
+		}
+		for _, id := range change.Locked {
+			locked[id] = struct{}{}
+		}
+		for _, id := range change.Deleted {
+			delete(next.Media, id)
+			delete(ids, id)
+		}
+	}
+	ordered := slices.Sorted(maps.Keys(ids))
+	for batch := range slices.Chunk(ordered, pageSize) {
+		if err := f.fetchMedia(ctx, batch, func(item api.Media) error {
+			next.Media[item.ID] = item
+			if _, isLocked := locked[item.ID]; !isLocked && item.Status != "L" {
+				delete(ids, item.ID)
+			}
+			return nil
+		}); err != nil {
+			return false, err
+		}
+	}
+	// Unfinished uploads may not yet be visible to the metadata endpoint.
+	next.Pending = slices.Sorted(maps.Keys(ids))
+	next.Anchor = timestamp
+	if c.db != nil {
+		if err := c.db.Do(true, &metadataOp{state: next, write: true}); err != nil {
+			return false, fmt.Errorf("save metadata cache: %w", err)
+		}
+	}
+	c.state = next
+	c.byName = make(map[mediaKey]api.ID, len(next.Media))
+	for _, id := range slices.Sorted(maps.Keys(next.Media)) {
+		c.byName[f.mediaKey(next.Media[id])] = id
+	}
+	c.checked = time.Now()
+	fs.Debugf(f, "Refreshed metadata cache: fetched %d media IDs, %d pending", len(ordered), len(next.Pending))
+	return foldersChanged, nil
+}
+
+// Shutdown closes the persistent metadata cache.
+func (f *Fs) Shutdown(ctx context.Context) error {
+	if c := f.metadata; c != nil {
+		c.refreshMu.Lock()
+		defer c.refreshMu.Unlock()
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.db != nil && !c.db.IsStopped() {
+			var err error
+			if c.state != nil {
+				err = c.db.Do(true, &metadataOp{state: c.state, write: true})
+			}
+			err = errors.Join(err, c.db.Stop(false))
+			c.db = nil
+			return err
+		}
+	}
+	return nil
+}
+
 func (f *Fs) folders(ctx context.Context) ([]api.Folder, error) {
+	if c := f.metadata; c != nil {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return slices.Clone(c.state.Folders), nil
+	}
+	return f.fetchFolders(ctx)
+}
+
+func (f *Fs) fetchFolders(ctx context.Context) ([]api.Folder, error) {
 	var folders []api.Folder
 	seen := map[api.ID]struct{}{}
 	for offset := 0; ; {
@@ -579,16 +915,36 @@ func (f *Fs) CreateDir(ctx context.Context, parent, leaf string) (string, error)
 	folder := api.Folder{Name: f.opt.Enc.FromStandardName(leaf), ParentID: api.ID(parent)}
 	reply, err := f.request(ctx, http.MethodPost, "/media/folder", "save", nil, folder)
 	if err != nil {
+		f.expireMetadata()
 		return "", err
 	}
 
 	if reply.ID == "" {
+		f.expireMetadata()
 		return "", errors.New("folder creation returned no ID")
 	}
+	folder.ID = reply.ID
+	folder.Date = time.Now().UnixMilli()
+	f.cacheFolder(folder, false)
 	return string(reply.ID), nil
 }
 
 func (f *Fs) media(ctx context.Context, ids []api.ID, visit func(api.Media) error) error {
+	if c := f.metadata; c != nil && ids == nil {
+		c.mu.Lock()
+		items := slices.Collect(maps.Values(c.state.Media))
+		c.mu.Unlock()
+		for _, item := range items {
+			if err := visit(item); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return f.fetchMedia(ctx, ids, visit)
+}
+
+func (f *Fs) fetchMedia(ctx context.Context, ids []api.ID, visit func(api.Media) error) error {
 	for offset := 0; ; {
 		params := url.Values{}
 		data := map[string]any{"fields": []string{"name", "size", "modificationdate", "url", "folderid"}}
@@ -636,6 +992,9 @@ func (f *Fs) media(ctx context.Context, ids []api.ID, visit func(api.Media) erro
 
 // List lists the files and directories in dir.
 func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
+	if err := f.syncMetadata(ctx); err != nil {
+		return nil, err
+	}
 	parent, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
 		return nil, err
@@ -670,6 +1029,9 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 
 // NewObject finds a file by its path, returning ErrorObjectNotFound if absent.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	if err := f.syncMetadata(ctx); err != nil {
+		return nil, err
+	}
 	leaf, parent, err := f.dirCache.FindPath(ctx, remote, false)
 	if errors.Is(err, fs.ErrorDirNotFound) {
 		return nil, fs.ErrorObjectNotFound
@@ -677,6 +1039,22 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 
 	if err != nil {
 		return nil, err
+	}
+	if c := f.metadata; c != nil {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if parent == "0" {
+			parent = ""
+		}
+		if parent != "" && !slices.ContainsFunc(c.state.Folders, func(folder api.Folder) bool {
+			return string(folder.ID) == parent && !folder.SoftDeleted && folder.Status != statusDeleted
+		}) {
+			return nil, fs.ErrorObjectNotFound
+		}
+		if id, ok := c.byName[mediaKey{parent: parent, name: leaf}]; ok {
+			return &Object{fs: f, remote: remote, info: c.state.Media[id]}, nil
+		}
+		return nil, fs.ErrorObjectNotFound
 	}
 	var found *Object
 	err = f.media(ctx, nil, func(item api.Media) error {
@@ -697,12 +1075,17 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 
 // Mkdir creates dir and its missing parents.
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
+	if err := f.syncMetadata(ctx); err != nil {
+		return err
+	}
 	_, err := f.dirCache.FindDir(ctx, dir, true)
 	return err
 }
 
 // Rmdir removes an empty directory, returning ErrorDirectoryNotEmpty otherwise.
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
+	// Cached emptiness must not authorize removal after another client adds files.
+	f.expireMetadata()
 	entries, err := f.List(ctx, dir)
 	if err != nil {
 		return err
@@ -721,7 +1104,10 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	}
 	_, err = f.request(ctx, http.MethodPost, "/media/folder", "delete", nil, map[string]any{"folders": []api.ID{api.ID(id)}})
 	if err == nil {
+		f.cacheFolder(api.Folder{ID: api.ID(id)}, true)
 		f.dirCache.FlushDir(dir)
+	} else {
+		f.expireMetadata()
 	}
 	return err
 }
@@ -821,6 +1207,9 @@ func (o *Object) waitMetadata(ctx context.Context) error {
 	for {
 		err := o.refresh(ctx)
 		if !errors.Is(err, fs.ErrorObjectNotFound) {
+			if err == nil {
+				o.fs.cacheMedia(o.info, false)
+			}
 			return err
 		}
 
@@ -964,9 +1353,17 @@ func (f *Fs) open(ctx context.Context, u *url.URL, options []fs.OpenOption) (io.
 }
 
 // Update replaces content and waits for the uploaded object to be available.
-func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
+	defer func() {
+		if err != nil {
+			o.fs.expireMetadata()
+		}
+	}()
 	if src.Size() < 0 {
 		return errors.New("OneMediaHub uploads require a known size")
+	}
+	if err := o.fs.syncMetadata(ctx); err != nil {
+		return err
 	}
 	leaf, parent, err := o.fs.dirCache.FindPath(ctx, o.remote, true)
 	if err != nil {
@@ -1093,6 +1490,11 @@ func (o *Object) Remove(ctx context.Context) error {
 		return fmt.Errorf("unsupported media type %q", o.info.Type)
 	}
 	_, err := o.fs.request(ctx, http.MethodPost, "/media/"+o.info.Type, "delete", url.Values{"softdelete": {"true"}}, map[string]any{field: []api.ID{o.info.ID}})
+	if err == nil {
+		o.fs.cacheMedia(o.info, true)
+	} else {
+		o.fs.expireMetadata()
+	}
 	return err
 }
 
@@ -1101,5 +1503,6 @@ var (
 	_ fs.Object          = (*Object)(nil)
 	_ fs.IDer            = (*Object)(nil)
 	_ fs.Abouter         = (*Fs)(nil)
+	_ fs.Shutdowner      = (*Fs)(nil)
 	_ dircache.DirCacher = (*Fs)(nil)
 )

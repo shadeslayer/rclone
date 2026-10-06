@@ -81,6 +81,21 @@ metadata-only item on the server; rclone reports the media ID in content and
 processing errors. Multipart uploads remain the default for compatibility
 with other OneMediaHub deployments.
 
+To reduce metadata requests during copy and sync, enable `metadata_cache`, or
+use `--onemediahub-metadata-cache`. Rclone uses the same changes API as the O2
+Windows client and fetches changed media IDs in batches. It stores the account's
+metadata in rclone's cache directory using the shared `lib/kv` framework, so
+later runs can fetch changes instead of rebuilding the account listing.
+Systems without persistent-store support keep the cache in memory.
+
+The changes API is checked at startup and then at most once per minute when
+metadata is needed. Adjust the interval with `--onemediahub-metadata-cache-time`.
+Changes made by other clients may remain invisible during that interval.
+Successful rclone uploads and deletions update the cache immediately, and
+downloads always request fresh metadata for their URLs. Caching is disabled
+by default because it requires the profile and changes APIs. It reduces API
+traffic but does not establish whether a particular HTTP 403 is throttling.
+
 A configured remote's server can also be selected with
 `--onemediahub-url https://cloud.example.com`. Its saved credentials must
 belong to that server. Use separate remotes for separate accounts or servers.
