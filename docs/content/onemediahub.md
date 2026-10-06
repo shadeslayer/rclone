@@ -96,6 +96,17 @@ downloads always request fresh metadata for their URLs. Caching is disabled
 by default because it requires the profile and changes APIs. It reduces API
 traffic but does not establish whether a particular HTTP 403 is throttling.
 
+File deletions are batched by default, grouped by media type, and confirmed
+before rclone reports success for each file. Batches contain at most 1,000
+entries and are limited by `--checkers`; smaller batches flush after 20 ms
+of inactivity. Set `--onemediahub-delete-batch-size` to reduce the maximum,
+or set it to `1` for individual requests. If an already-trashed file rejects
+a batch, rclone retries its members individually to identify failing files
+and delete the others. A file confirmed as already in the trash counts as
+deleted. Other failures, including network, quota and permission errors,
+are returned without retrying the batch. Folder deletion continues to
+require an empty folder.
+
 A configured remote's server can also be selected with
 `--onemediahub-url https://cloud.example.com`. Its saved credentials must
 belong to that server. Use separate remotes for separate accounts or servers.

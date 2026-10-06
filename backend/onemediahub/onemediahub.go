@@ -53,6 +53,7 @@ import (
 
 const (
 	pageSize             = 100
+	deleteBatchLimit     = 1000
 	minSleep             = 10 * time.Millisecond
 	maxSleep             = 2 * time.Second
 	decayConstant        = 2
@@ -174,6 +175,12 @@ func init() {
 				Advanced: true,
 			},
 			{
+				Name:     "delete_batch_size",
+				Help:     "Maximum number of file deletions to batch, from 1 to 1000. Batching is synchronous and groups files by media type. Actual batches are limited by --checkers; smaller batches flush after 20 ms of inactivity. Set to 1 to send individual requests.",
+				Default:  deleteBatchLimit,
+				Advanced: true,
+			},
+			{
 				Name:     "async_upload",
 				Help:     "Register metadata separately and upload raw content with asynchronous server processing instead of multipart uploads.",
 				Default:  false,
@@ -277,6 +284,7 @@ type options struct {
 	UploadTimeout     fs.Duration          `config:"upload_timeout"`
 	MetadataCache     bool                 `config:"metadata_cache"`      // MetadataCache enables account metadata caching.
 	MetadataCacheTime fs.Duration          `config:"metadata_cache_time"` // MetadataCacheTime is the interval between changes API refreshes.
+	DeleteBatchSize   int                  `config:"delete_batch_size"`
 	APIPath           string               `config:"api_path"`
 	RootFolderID      string               `config:"root_folder_id"`
 	FlatNamespace     bool                 `config:"flat_namespace"` // FlatNamespace stores a virtual tree in encoded media names.
@@ -320,6 +328,9 @@ func readOptions(m configmap.Mapper) (*options, error) {
 	if opt.MetadataCache && opt.MetadataCacheTime <= 0 {
 		return nil, errors.New("metadata_cache_time must be positive")
 	}
+	if opt.DeleteBatchSize < 1 || opt.DeleteBatchSize > deleteBatchLimit {
+		return nil, fmt.Errorf("delete_batch_size must be between 1 and %d", deleteBatchLimit)
+	}
 
 	if strings.ContainsAny(opt.APIPath, "?#") || strings.Contains(opt.APIPath, "://") {
 		return nil, errors.New("api_path must be a relative SAPI path")
@@ -347,6 +358,7 @@ type Fs struct {
 	downloadRefresh  singleflight.Group
 	validation       *batcher.Batcher[validationItem, string]
 	validationCancel context.CancelFunc
+	deletions        *batcher.Batcher[deleteItem, error]
 	uploadURL        string
 	name             string
 	root             string
@@ -467,6 +479,13 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		if err != nil {
 			return nil, err
 		}
+	}
+	f.deletions, err = batcher.New(ctx, f, f.commitDeletes, batcher.Options{
+		Mode: "sync", Size: min(opt.DeleteBatchSize, max(1, fs.GetConfig(ctx).Checkers)),
+		MaxBatchSize: deleteBatchLimit, Timeout: 20 * time.Millisecond,
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	if opt.FlatNamespace {
@@ -1098,8 +1117,11 @@ func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
 	return foldersChanged, nil
 }
 
-// Shutdown stops upload validation and closes the persistent caches.
+// Shutdown finishes deletion batches, stops upload validation and closes the persistent caches.
 func (f *Fs) Shutdown(ctx context.Context) error {
+	if f.deletions != nil {
+		f.deletions.Shutdown()
+	}
 	if f.validationCancel != nil {
 		f.validationCancel()
 	}
@@ -3780,19 +3802,100 @@ func (f *Fs) checkUploads(ctx context.Context, items []validationItem, results [
 
 // Remove moves the media item to the trash.
 func (o *Object) Remove(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	o.fs.downloadURLs.DeletePrefix(string(o.info.ID) + "/")
 	switch o.info.Type {
 	case "picture", "video", "audio", "file":
 	default:
 		return fmt.Errorf("unsupported media type %q", o.info.Type)
 	}
-	_, err := o.fs.request(ctx, http.MethodPost, "/media/"+o.info.Type, "delete", url.Values{"softdelete": {"true"}}, map[string]any{o.info.Type + "s": []api.ID{o.info.ID}})
-	if err == nil {
-		o.fs.cacheMedia(o.info, true)
-	} else {
-		o.fs.expireMetadata()
+	result, err := o.fs.deletions.Commit(ctx, o.remote, deleteItem{ctx: ctx, info: o.info})
+	if err != nil {
+		return err
 	}
-	return err
+	return result
+}
+
+type deleteItem struct {
+	ctx  context.Context
+	info api.Media
+}
+
+func (f *Fs) commitDeletes(_ context.Context, items []deleteItem, results []error, _ []error) error {
+	groups := map[string][]int{}
+	for i, item := range items {
+		results[i] = item.ctx.Err()
+		if results[i] == nil {
+			groups[item.info.Type] = append(groups[item.info.Type], i)
+		}
+	}
+	for _, typ := range slices.Sorted(maps.Keys(groups)) {
+		indexes := groups[typ]
+		func() {
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(items[indexes[0]].ctx), metadataTimeout)
+			defer cancel()
+			var active atomic.Int32
+			active.Store(int32(len(indexes)))
+			for _, i := range indexes {
+				stop := context.AfterFunc(items[i].ctx, func() {
+					if active.Add(-1) == 0 {
+						cancel()
+					}
+				})
+				defer stop()
+			}
+			f.deleteMediaBatch(ctx, items, indexes, results)
+		}()
+	}
+	// Errors are results so the shared batcher does not label deletions as uploads.
+	return nil
+}
+
+func (f *Fs) deleteMediaBatch(ctx context.Context, items []deleteItem, indexes []int, results []error) {
+	var ids []api.ID
+	seen := map[api.ID]bool{}
+	active := make([]int, 0, len(indexes))
+	for _, i := range indexes {
+		if results[i] = items[i].ctx.Err(); results[i] != nil {
+			continue
+		}
+		active = append(active, i)
+		id := items[i].info.ID
+		if !seen[id] {
+			ids = append(ids, id)
+			seen[id] = true
+		}
+	}
+	if len(active) == 0 {
+		return
+	}
+	typ := items[active[0]].info.Type
+	_, err := f.request(ctx, http.MethodPost, "/media/"+typ, "delete", url.Values{"softdelete": {"true"}}, map[string]any{typ + "s": ids})
+	if err != nil {
+		// Failed batches can leave some members deleted without confirming them.
+		f.expireMetadata()
+	}
+	var apiErr *api.Error
+	if errors.As(err, &apiErr) && apiErr.Code == "MED-1022" {
+		if len(ids) == 1 {
+			// Already-trashed status confirms deletion only for a single ID.
+			err = nil
+		} else {
+			// A batch's already-trashed error does not identify the affected ID.
+			for _, i := range active {
+				f.deleteMediaBatch(ctx, items, []int{i}, results)
+			}
+			return
+		}
+	}
+	for _, i := range active {
+		results[i] = err
+		if err == nil {
+			f.cacheMedia(items[i].info, true)
+		}
+	}
 }
 
 var (
