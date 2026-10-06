@@ -1784,8 +1784,14 @@ func TestAsyncUploadTimeoutOption(t *testing.T) {
 }
 
 func TestAsyncUploadResume(t *testing.T) {
-	for _, fullyUploaded := range []bool{false, true} {
-		t.Run(strconv.FormatBool(fullyUploaded), func(t *testing.T) {
+	for _, tc := range []struct {
+		name, prefix string
+		accepted     int
+	}{
+		{"partial", "", 3}, {"complete", "", 6},
+		{"none", "", 0}, {"none with unit", "bytes=", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			fx := newFixture(t)
 			var metadataCalls, rawCalls, probes atomic.Int32
 			var saved string
@@ -1798,10 +1804,11 @@ func TestAsyncUploadResume(t *testing.T) {
 						jsonReply(t, w, map[string]string{"id": "42"})
 						return
 					}
+					assert.Equal(t, "42", r.Header.Get("X-funambol-id"))
 					if r.Header.Get("Content-Range") == "bytes */6" {
 						probes.Add(1)
 						assert.EqualValues(t, 0, r.ContentLength)
-						w.Header().Set("Range", "0-"+strconv.Itoa(len(saved)-1))
+						w.Header().Set("Range", tc.prefix+"0-"+strconv.Itoa(len(saved)-1))
 						w.WriteHeader(308)
 						_, _ = io.WriteString(w, "<html>Resume</html>")
 						return
@@ -1810,17 +1817,14 @@ func TestAsyncUploadResume(t *testing.T) {
 					body, err := io.ReadAll(r.Body)
 					require.NoError(t, err)
 					if call == 1 {
-						if fullyUploaded {
-							saved = string(body)
-						} else {
-							saved = string(body[:3])
-						}
+						assert.Equal(t, "abcdef", string(body))
+						saved = string(body[:tc.accepted])
 						w.WriteHeader(503)
 						return
 					}
-					assert.Equal(t, "bytes 3-5/6", r.Header.Get("Content-Range"))
-					assert.EqualValues(t, 3, r.ContentLength)
-					assert.Equal(t, "def", string(body))
+					assert.Equal(t, fmt.Sprintf("bytes %d-5/6", tc.accepted), r.Header.Get("Content-Range"))
+					assert.EqualValues(t, 6-tc.accepted, r.ContentLength)
+					assert.Equal(t, "abcdef"[tc.accepted:], string(body))
 					saved += string(body)
 					w.WriteHeader(202)
 					return
@@ -1849,7 +1853,7 @@ func TestAsyncUploadResume(t *testing.T) {
 			assert.Equal(t, "42", o.(*Object).ID())
 			assert.EqualValues(t, 1, metadataCalls.Load())
 			assert.EqualValues(t, 1, probes.Load())
-			if fullyUploaded {
+			if tc.accepted == 6 {
 				assert.EqualValues(t, 1, rawCalls.Load())
 			} else {
 				assert.EqualValues(t, 2, rawCalls.Load())
@@ -1863,7 +1867,9 @@ func TestAsyncUploadResumeRejectsUnsafeOffsets(t *testing.T) {
 		name, rangeValue, want string
 		seekable               bool
 	}{
-		{"missing", "", "invalid Range", true}, {"nonzero start", "1-2", "invalid Range", true}, {"beyond size", "0-9", "invalid Range", true}, {"negative end", "0--1", "invalid Range", true}, {"multiple ranges", "0-2,4-5", "invalid Range", true}, {"non-seekable", "0-2", "non-seekable", false},
+		{"missing", "", "invalid Range", true}, {"nonzero start", "1-2", "invalid Range", true}, {"beyond size", "0-9", "invalid Range", true},
+		{"negative end", "0--2", "invalid Range", true}, {"negative nonzero start", "1--1", "invalid Range", true}, {"noncanonical negative end", "0--01", "invalid Range", true},
+		{"multiple ranges", "0-2,4-5", "invalid Range", true}, {"non-seekable", "0-2", "non-seekable", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fx := newFixture(t)
@@ -1903,6 +1909,50 @@ func TestAsyncUploadResumeRejectsUnsafeOffsets(t *testing.T) {
 			_, err = f.Put(ctx, reader, src)
 			require.ErrorContains(t, err, tc.want)
 			assert.EqualValues(t, 1, rawCalls.Load())
+		})
+	}
+}
+
+func TestUploadOffsetEmptySentinel(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		status   int
+		size     int64
+		accepted bool
+	}{
+		{"resume incomplete", http.StatusPermanentRedirect, 6, true},
+		{"HTTP success", http.StatusOK, 6, false},
+		{"empty file", http.StatusPermanentRedirect, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newFixture(t)
+			handler := fx.server.Config.Handler
+			fx.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/sapi/upload/file" {
+					handler.ServeHTTP(w, r)
+					return
+				}
+				assert.Equal(t, "bytes */"+strconv.FormatInt(tc.size, 10), r.Header.Get("Content-Range"))
+				assert.Equal(t, "42", r.Header.Get("X-funambol-id"))
+				assert.Zero(t, r.ContentLength)
+				w.Header().Set("Range", "0--1")
+				w.WriteHeader(tc.status)
+			})
+			ctx := context.Background()
+			remote, err := NewFs(ctx, "empty-offset", "", fx.config(t))
+			require.NoError(t, err)
+			f := remote.(*Fs)
+			t.Cleanup(func() { require.NoError(t, f.Shutdown(ctx)) })
+			o := &Object{fs: f, info: api.Media{ID: "42"}}
+			offset, err := o.uploadOffset(ctx, tc.size)
+			if tc.accepted {
+				require.NoError(t, err)
+				assert.Zero(t, offset)
+			} else {
+				require.ErrorContains(t, err, "invalid Range")
+				assert.Contains(t, err.Error(), fmt.Sprintf("HTTP %d", tc.status))
+				assert.Contains(t, err.Error(), `Range="0--1"`)
+			}
 		})
 	}
 }

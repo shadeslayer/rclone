@@ -3816,10 +3816,15 @@ func (o *Object) uploadOffset(ctx context.Context, size int64) (int64, error) {
 				return retry(ctx, resp, fmt.Errorf("upload offset probe: HTTP %s", resp.Status))
 			}
 			rangeValue := strings.TrimPrefix(strings.TrimSpace(resp.Header.Get("Range")), "bytes=")
+			// O2 uses an inclusive end of -1 when no upload bytes have been accepted.
+			if resp.StatusCode == http.StatusPermanentRedirect && size > 0 && rangeValue == "0--1" {
+				offset = 0
+				return false, nil
+			}
 			start, end, ok := strings.Cut(rangeValue, "-")
 			last, parseErr := strconv.ParseInt(end, 10, 64)
 			if !ok || start != "0" || parseErr != nil || last < 0 || last >= size {
-				return false, errors.New("upload offset probe returned an invalid Range")
+				return false, fmt.Errorf("upload offset probe returned an invalid Range (HTTP %d, Range=%.128q, size=%d)", resp.StatusCode, resp.Header.Get("Range"), size)
 			}
 			offset = last + 1
 			return false, nil

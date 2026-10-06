@@ -29,3 +29,11 @@ upload/source and journal validation required for crypt and restart safety.
 Validation covers legacy caches with an empty changes feed, active files
 shadowed by higher-ID trashed duplicates, and local cache writes of deleted
 media/folders. Both commits receive adversarial review before committing.
+
+[x] Fix asynchronous upload recovery after zero bytes were accepted
+
+O2 returns HTTP 308 with Range: 0--1 for an upload with no accepted content.
+Recognize that exact response for nonempty files, preserving rejection of
+missing or malformed offsets. Invalid-range errors include bounded response
+details. Regression coverage includes temporary 503 failures, partial and
+fully accepted uploads, and recovery across process restarts.

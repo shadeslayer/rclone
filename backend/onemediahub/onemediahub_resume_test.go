@@ -181,7 +181,7 @@ func runRecoveryProcess(t *testing.T, helper string, input recoveryProcessInput)
 
 func TestUploadRecoveryAcrossProcesses(t *testing.T) {
 	helper := recoveryHelper(t)
-	for _, mode := range []string{"partial", "buffered", "copy command", "size-only copy command", "accepted", "processing", "changed content", "old replacement validation", "missing range", "trashed", "deleted", "soft deleted status"} {
+	for _, mode := range []string{"partial", "none", "buffered", "copy command", "size-only copy command", "accepted", "processing", "changed content", "old replacement validation", "missing range", "trashed", "deleted", "soft deleted status"} {
 		t.Run(mode, func(t *testing.T) {
 			copyCommand := strings.HasSuffix(mode, "copy command")
 			content := "abcdef"
@@ -226,6 +226,8 @@ func TestUploadRecoveryAcrossProcesses(t *testing.T) {
 					if stage.Load() == 1 {
 						if mode == "accepted" || mode == "processing" {
 							saved = string(b)
+						} else if mode == "none" {
+							saved = ""
 						} else {
 							saved = string(b[:3])
 						}
@@ -233,7 +235,7 @@ func TestUploadRecoveryAcrossProcesses(t *testing.T) {
 						if mode == "changed content" {
 							assert.Empty(t, r.Header.Get("Content-Range"))
 						} else {
-							assert.Equal(t, fmt.Sprintf("bytes 3-%d/%d", size-1, size), r.Header.Get("Content-Range"))
+							assert.Equal(t, fmt.Sprintf("bytes %d-%d/%d", len(saved), size-1, size), r.Header.Get("Content-Range"))
 						}
 						saved += string(b)
 					}
