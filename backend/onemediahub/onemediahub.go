@@ -360,33 +360,36 @@ func checkResumeUploadOptions(ctx context.Context, opt *options) error {
 
 // Fs represents a OneMediaHub remote.
 type Fs struct {
-	downloadURLs     *cache.Cache
-	downloadRefresh  singleflight.Group
-	validation       *batcher.Batcher[validationItem, string]
-	validationCancel context.CancelFunc
-	metadataReads    *batcher.Batcher[metadataItem, api.Media]
-	metadataCancel   context.CancelFunc
-	deletions        *batcher.Batcher[deleteItem, error]
-	deleteMu         sync.Mutex
-	deletePending    int
-	deleteCause      error
-	deleteError      error
-	uploadURL        string
-	name             string
-	root             string
-	opt              *options
-	features         *fs.Features
-	srv              *rest.Client
-	download         *rest.Client
-	auth             *auth
-	dirCache         *dircache.DirCache
-	pacer            *fs.Pacer
-	metadata         *metadataCache
-	uploadJournal    *kv.DB
-	uploadJournalMu  sync.RWMutex
-	flatMu           sync.Mutex
-	flatDirMu        sync.Mutex
-	flatRecords      map[api.ID]flatPathRecord
+	downloadURLs       *cache.Cache
+	downloadRefresh    singleflight.Group
+	validation         *batcher.Batcher[validationItem, string]
+	validationCancel   context.CancelFunc
+	validationRequests chan *validationWaiter
+	validationWake     chan struct{}
+	validationDone     chan struct{}
+	metadataReads      *batcher.Batcher[metadataItem, api.Media]
+	metadataCancel     context.CancelFunc
+	deletions          *batcher.Batcher[deleteItem, error]
+	deleteMu           sync.Mutex
+	deletePending      int
+	deleteCause        error
+	deleteError        error
+	uploadURL          string
+	name               string
+	root               string
+	opt                *options
+	features           *fs.Features
+	srv                *rest.Client
+	download           *rest.Client
+	auth               *auth
+	dirCache           *dircache.DirCache
+	pacer              *fs.Pacer
+	metadata           *metadataCache
+	uploadJournal      *kv.DB
+	uploadJournalMu    sync.RWMutex
+	flatMu             sync.Mutex
+	flatDirMu          sync.Mutex
+	flatRecords        map[api.ID]flatPathRecord
 }
 
 // Object describes a OneMediaHub media item.
@@ -492,6 +495,10 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		if err != nil {
 			return nil, err
 		}
+		f.validationRequests = make(chan *validationWaiter, pageSize)
+		f.validationWake = make(chan struct{}, 1)
+		f.validationDone = make(chan struct{})
+		go f.runValidation(validationCtx)
 	}
 	metadataCtx, cancelMetadata := context.WithCancel(context.Background())
 	f.metadataCancel = cancelMetadata
@@ -1213,6 +1220,9 @@ func (f *Fs) Shutdown(ctx context.Context) error {
 	}
 	if f.validationCancel != nil {
 		f.validationCancel()
+		if f.validationDone != nil {
+			<-f.validationDone
+		}
 	}
 	if f.validation != nil {
 		f.validation.Shutdown()
@@ -3140,6 +3150,12 @@ type metadataItem struct {
 
 func uploadBatchContext(ctx context.Context, contexts []context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithTimeout(ctx, metadataTimeout)
+	ctx, stop := uploadBatchCancellation(ctx, contexts)
+	return ctx, func() { stop(); cancel() }
+}
+
+func uploadBatchCancellation(ctx context.Context, contexts []context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(ctx)
 	var active atomic.Int32
 	active.Store(int32(len(contexts)))
 	stops := make([]func() bool, 0, len(contexts))
@@ -4228,39 +4244,167 @@ func (o *Object) uploadOffset(ctx context.Context, size int64) (int64, error) {
 func (o *Object) waitUpload(ctx context.Context, folderID api.ID) error {
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(o.fs.opt.UploadTimeout))
 	defer cancel()
-	delay := metadataDelay
-	for {
-		type response struct {
-			status string
-			err    error
+	f := o.fs
+	waiter := &validationWaiter{ctx: ctx, id: o.info.ID, folderID: folderID, result: make(chan error, 1)}
+	stop := context.AfterFunc(ctx, func() {
+		select {
+		case f.validationWake <- struct{}{}:
+		default:
 		}
-		result := make(chan response, 1)
+	})
+	defer stop()
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("wait for upload processing for media %s: %w", waiter.id, ctx.Err())
+	case <-f.validationDone:
+		return fmt.Errorf("wait for upload processing for media %s: %w", waiter.id, context.Canceled)
+	case f.validationRequests <- waiter:
+	}
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("wait for upload processing for media %s: %w", waiter.id, ctx.Err())
+	case <-f.validationDone:
+		return fmt.Errorf("wait for upload processing for media %s: %w", waiter.id, context.Canceled)
+	case err := <-waiter.result:
+		if err != nil {
+			return fmt.Errorf("check upload processing for media %s: %w", waiter.id, err)
+		}
+		return nil
+	}
+}
+
+type validationWaiter struct {
+	ctx          context.Context
+	id, folderID api.ID
+	result       chan error
+}
+
+type validationResult struct {
+	status string
+	err    error
+}
+
+type validationUpdate struct {
+	waiter *validationWaiter
+	validationResult
+	done bool
+}
+
+func (f *Fs) pollValidation(ctx context.Context, waiters []*validationWaiter, updates chan<- validationUpdate) {
+	schedulerCtx := ctx
+	defer func() {
+		select {
+		case updates <- validationUpdate{done: true}:
+		case <-schedulerCtx.Done():
+		}
+	}()
+	ids := make(map[api.ID]api.ID)
+	byID := make(map[api.ID][]*validationWaiter)
+	for _, waiter := range waiters {
+		ids[waiter.id] = waiter.folderID
+		byID[waiter.id] = append(byID[waiter.id], waiter)
+	}
+	type result struct {
+		id api.ID
+		validationResult
+	}
+	results := make(chan result, len(ids))
+	for id, folder := range ids {
+		var itemContexts []context.Context
+		for _, waiter := range byID[id] {
+			itemContexts = append(itemContexts, waiter.ctx)
+		}
+		itemCtx, cancelItem := uploadBatchCancellation(ctx, itemContexts)
 		go func() {
-			status, err := o.fs.validation.Commit(ctx, string(o.info.ID), validationItem{ctx: ctx, id: o.info.ID, folderID: folderID})
-			result <- response{status, err}
+			defer cancelItem()
+			status, err := f.validation.Commit(itemCtx, string(id), validationItem{ctx: itemCtx, id: id, folderID: folder})
+			results <- result{id, validationResult{status, err}}
 		}()
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("wait for upload processing for media %s: %w", o.info.ID, ctx.Err())
-		case item := <-result:
-			if item.err != nil {
-				return fmt.Errorf("check upload processing for media %s: %w", o.info.ID, item.err)
+	}
+	for range ids {
+		result := <-results
+		for _, waiter := range byID[result.id] {
+			select {
+			case updates <- validationUpdate{waiter: waiter, validationResult: result.validationResult}:
+			case <-schedulerCtx.Done():
+				return
 			}
-			switch item.status {
-			case "V":
-				return nil
-			case "U", "A":
-				// Acceptance does not guarantee the server has processed the content.
-			default:
-				return fmt.Errorf("upload processing for media %s returned status %q", o.info.ID, item.status)
+		}
+	}
+}
+
+func (f *Fs) runValidation(ctx context.Context) {
+	defer close(f.validationDone)
+	pending := make(map[*validationWaiter]struct{})
+	results := make(chan validationUpdate, pageSize)
+	timer := time.NewTimer(20 * time.Millisecond)
+	timer.Stop()
+	defer timer.Stop()
+	var ticks <-chan time.Time
+	delay := metadataDelay
+	running := false
+	for {
+		for waiter := range pending {
+			if waiter.ctx.Err() != nil {
+				delete(pending, waiter)
 			}
+		}
+		if len(pending) == 0 && !running {
+			timer.Stop()
+			ticks = nil
+			delay = metadataDelay
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("wait for upload processing for media %s: %w", o.info.ID, ctx.Err())
-		case <-time.After(delay):
+			return
+		case waiter := <-f.validationRequests:
+			conflict := false
+			for other := range pending {
+				if other.id == waiter.id && !sameParent(other.folderID, string(waiter.folderID)) {
+					conflict = true
+					break
+				}
+			}
+			if conflict {
+				waiter.result <- errors.New("conflicting parent for pending upload validation")
+				continue
+			}
+			pending[waiter] = struct{}{}
+			if !running && ticks == nil {
+				timer.Reset(20 * time.Millisecond)
+				ticks = timer.C
+			}
+		case <-f.validationWake:
+		case <-ticks:
+			ticks = nil
+			if len(pending) == 0 {
+				continue
+			}
+			running = true
+			waiters := slices.Collect(maps.Keys(pending))
+			go f.pollValidation(ctx, waiters, results)
+		case checked := <-results:
+			if !checked.done {
+				if _, found := pending[checked.waiter]; !found {
+					continue
+				}
+				if checked.err == nil && (checked.status == "U" || checked.status == "A") {
+					continue
+				}
+				if checked.err == nil && checked.status != "V" {
+					checked.err = fmt.Errorf("upload processing returned status %q", checked.status)
+				}
+				checked.waiter.result <- checked.err
+				delete(pending, checked.waiter)
+				continue
+			}
+			running = false
+			if len(pending) != 0 {
+				timer.Reset(delay)
+				ticks = timer.C
+				delay = min(2*delay, metadataMaxDelay)
+			}
 		}
-		delay = min(2*delay, metadataMaxDelay)
 	}
 }
 
