@@ -15,6 +15,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"slices"
 	"strconv"
@@ -23,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/google/uuid"
 	"github.com/rclone/rclone/backend/onemediahub/api"
 	"github.com/rclone/rclone/fs"
@@ -63,6 +65,7 @@ const (
 	maxErrorSize         = 64 * 1024
 	sessionCookie        = "JSESSIONID"
 	metadataVersion      = 2
+	uploadJournalVersion = 1
 )
 
 func init() {
@@ -172,6 +175,12 @@ func init() {
 				Advanced: true,
 			},
 			{
+				Name:     "resume_uploads",
+				Help:     "Persist unfinished asynchronous uploads in rclone's cache directory so later runs can resume them. Requires async_upload, a reopenable source with a reliable content hash, and input that can safely be rewound. The input is verified before uploading, which adds a local read. Unfinished items are hidden until their upload is validated, so this option is incompatible with --immutable, --backup-dir, --suffix, --ignore-existing, and --update. Other inputs retain recovery within the current upload attempt. Keep the cache directory to preserve recovery state.",
+				Default:  false,
+				Advanced: true,
+			},
+			{
 				Name:     "upload_timeout",
 				Help:     "Maximum time to wait for asynchronous upload processing after sending content.",
 				Default:  fs.Duration(5 * time.Minute),
@@ -253,6 +262,7 @@ type options struct {
 	UserAgent         string               `config:"user_agent"`
 	UploadURL         string               `config:"upload_url"`
 	AsyncUpload       bool                 `config:"async_upload"`
+	ResumeUploads     bool                 `config:"resume_uploads"` // ResumeUploads enables persistent upload recovery.
 	UploadTimeout     fs.Duration          `config:"upload_timeout"`
 	MetadataCache     bool                 `config:"metadata_cache"`      // MetadataCache enables account metadata caching.
 	MetadataCacheTime fs.Duration          `config:"metadata_cache_time"` // MetadataCacheTime is the interval between changes API refreshes.
@@ -292,6 +302,9 @@ func readOptions(m configmap.Mapper) (*options, error) {
 	if opt.AsyncUpload && opt.UploadTimeout <= 0 {
 		return nil, errors.New("upload_timeout must be positive")
 	}
+	if opt.ResumeUploads && !opt.AsyncUpload {
+		return nil, errors.New("resume_uploads requires async_upload")
+	}
 	if opt.MetadataCache && opt.MetadataCacheTime <= 0 {
 		return nil, errors.New("metadata_cache_time must be positive")
 	}
@@ -306,6 +319,14 @@ func readOptions(m configmap.Mapper) (*options, error) {
 		}
 	}
 	return opt, nil
+}
+
+func checkResumeUploadOptions(ctx context.Context, opt *options) error {
+	ci := fs.GetConfig(ctx)
+	if opt.ResumeUploads && (ci.Immutable || ci.BackupDir != "" || ci.Suffix != "" || ci.IgnoreExisting || ci.UpdateOlder) {
+		return errors.New("resume_uploads is incompatible with --immutable, --backup-dir, --suffix, --ignore-existing, and --update")
+	}
+	return nil
 }
 
 // Fs represents a OneMediaHub remote.
@@ -325,6 +346,8 @@ type Fs struct {
 	dirCache         *dircache.DirCache
 	pacer            *fs.Pacer
 	metadata         *metadataCache
+	uploadJournal    *kv.DB
+	uploadJournalMu  sync.RWMutex
 }
 
 // Object describes a OneMediaHub media item.
@@ -338,6 +361,9 @@ type Object struct {
 func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	opt, err := readOptions(m)
 	if err != nil {
+		return nil, err
+	}
+	if err := checkResumeUploadOptions(ctx, opt); err != nil {
 		return nil, err
 	}
 
@@ -396,6 +422,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if _, err = f.auth.prepare(ctx); err != nil {
 		return nil, err
 	}
+	if opt.ResumeUploads {
+		if err := f.startUploadJournal(ctx); err != nil {
+			return nil, fmt.Errorf("start upload recovery: %w", err)
+		}
+	}
 	if opt.MetadataCache {
 		if err := f.startMetadataCache(ctx); err != nil {
 			return nil, fmt.Errorf("start metadata cache: %w", err)
@@ -425,7 +456,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	originalRoot, originalCache := f.root, f.dirCache
 	f.root = parent
 	f.dirCache = dircache.New(parent, opt.RootFolderID, f)
-	_, err = f.NewObject(ctx, leaf)
+	_, err = f.newObject(ctx, leaf, true)
 	if err == nil {
 		keepFs = true
 		return f, fs.ErrorIsFile
@@ -964,7 +995,7 @@ func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
 	return foldersChanged, nil
 }
 
-// Shutdown stops upload validation and closes the persistent metadata cache.
+// Shutdown stops upload validation and closes the persistent caches.
 func (f *Fs) Shutdown(ctx context.Context) error {
 	if f.validationCancel != nil {
 		f.validationCancel()
@@ -972,22 +1003,22 @@ func (f *Fs) Shutdown(ctx context.Context) error {
 	if f.validation != nil {
 		f.validation.Shutdown()
 	}
+	err := f.stopUploadJournal()
 	if c := f.metadata; c != nil {
 		c.refreshMu.Lock()
 		defer c.refreshMu.Unlock()
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		if c.db != nil && !c.db.IsStopped() {
-			var err error
 			if c.dirty {
-				err = c.db.Do(true, &metadataOp{state: c.state, write: true})
+				err = errors.Join(err, c.db.Do(true, &metadataOp{state: c.state, write: true}))
 			}
 			err = errors.Join(err, c.db.Stop(false))
 			c.db = nil
 			return err
 		}
 	}
-	return nil
+	return err
 }
 
 func (f *Fs) folders(ctx context.Context) ([]api.Folder, error) {
@@ -1144,6 +1175,10 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 	if err := f.syncMetadata(ctx); err != nil {
 		return nil, err
 	}
+	pending, err := f.pendingUploads()
+	if err != nil {
+		return nil, err
+	}
 	parent, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
 		return nil, err
@@ -1168,7 +1203,7 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 		entries = append(entries, fs.NewDir(remote, time.UnixMilli(folder.Date)).SetID(string(folder.ID)))
 	}
 	err = f.media(ctx, nil, func(item api.Media) error {
-		if sameParent(item.FolderID, parent) {
+		if sameParent(item.FolderID, parent) && pending[item.ID] == nil {
 			entries = append(entries, &Object{fs: f, remote: path.Join(dir, f.opt.Enc.ToStandardName(item.Name)), info: item})
 		}
 		return nil
@@ -1217,6 +1252,10 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) e
 	if err := f.syncMetadata(ctx); err != nil {
 		return err
 	}
+	pending, err := f.pendingUploads()
+	if err != nil {
+		return err
+	}
 	parent, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
 		return err
@@ -1261,6 +1300,9 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) e
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if pending[item.ID] != nil {
+			return nil
+		}
 		parent := item.FolderID
 		if parent == "0" {
 			parent = ""
@@ -1302,6 +1344,10 @@ func (f *Fs) notificationState(ctx context.Context) (map[notificationKey]notific
 }
 
 func (f *Fs) notificationEntries(ctx context.Context, folders []api.Folder, items []api.Media) (map[notificationKey]notificationEntry, error) {
+	pending, err := f.pendingUploads()
+	if err != nil {
+		return nil, err
+	}
 	paths, err := f.folderPaths(ctx, folders, api.ID(f.opt.RootFolderID), "")
 	if err != nil {
 		return nil, err
@@ -1331,7 +1377,7 @@ func (f *Fs) notificationEntries(ctx context.Context, folders []api.Folder, item
 			parent = ""
 		}
 		remote, found := paths[parent]
-		if !found || item.SoftDeleted || item.Status == statusDeleted {
+		if !found || item.SoftDeleted || item.Status == statusDeleted || pending[item.ID] != nil {
 			continue
 		}
 		if remote, found = relative(path.Join(remote, f.opt.Enc.ToStandardName(item.Name))); found {
@@ -1451,8 +1497,20 @@ func (f *Fs) ChangeNotify(ctx context.Context, notify func(string, fs.EntryType)
 
 // NewObject finds a file by its path, returning ErrorObjectNotFound if absent.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	return f.newObject(ctx, remote, false)
+}
+
+func (f *Fs) newObject(ctx context.Context, remote string, includePending bool) (fs.Object, error) {
 	if err := f.syncMetadata(ctx); err != nil {
 		return nil, err
+	}
+	var pending map[api.ID]*uploadRecord
+	if !includePending {
+		var err error
+		pending, err = f.pendingUploads()
+		if err != nil {
+			return nil, err
+		}
 	}
 	leaf, parent, err := f.dirCache.FindPath(ctx, remote, false)
 	if errors.Is(err, fs.ErrorDirNotFound) {
@@ -1473,14 +1531,14 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		}) {
 			return nil, fs.ErrorObjectNotFound
 		}
-		if id, ok := c.byName[mediaKey{parent: parent, name: leaf}]; ok {
+		if id, ok := c.byName[mediaKey{parent: parent, name: leaf}]; ok && pending[id] == nil {
 			return &Object{fs: f, remote: remote, info: c.state.Media[id]}, nil
 		}
 		return nil, fs.ErrorObjectNotFound
 	}
 	var found *Object
 	err = f.media(ctx, nil, func(item api.Media) error {
-		if sameParent(item.FolderID, parent) && f.opt.Enc.ToStandardName(item.Name) == leaf {
+		if sameParent(item.FolderID, parent) && f.opt.Enc.ToStandardName(item.Name) == leaf && pending[item.ID] == nil {
 			found = &Object{fs: f, remote: remote, info: item}
 		}
 		return nil
@@ -1519,6 +1577,15 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	id, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
 		return err
+	}
+	pending, err := f.pendingUploads()
+	if err != nil {
+		return err
+	}
+	for _, record := range pending {
+		if sameParent(record.FolderID, id) {
+			return fs.ErrorDirectoryNotEmpty
+		}
 	}
 
 	if id == "" {
@@ -1636,7 +1703,10 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 
 // Put creates or replaces an object and preserves its upload modification time.
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, opts ...fs.OpenOption) (fs.Object, error) {
-	existing, err := f.NewObject(ctx, src.Remote())
+	if err := checkResumeUploadOptions(ctx, f.opt); err != nil {
+		return nil, err
+	}
+	existing, err := f.newObject(ctx, src.Remote(), true)
 	if err == nil {
 		return existing, existing.Update(ctx, in, src, opts...)
 	}
@@ -1941,6 +2011,9 @@ func (f *Fs) open(ctx context.Context, u *url.URL, options []fs.OpenOption) (io.
 
 // Update replaces content and waits for the uploaded object to be available.
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
+	if err := checkResumeUploadOptions(ctx, o.fs.opt); err != nil {
+		return err
+	}
 	o.fs.downloadURLs.DeletePrefix(string(o.info.ID) + "/")
 	defer func() {
 		if err != nil {
@@ -1980,35 +2053,463 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	return o.waitMetadata(ctx)
 }
 
-func (o *Object) uploadAsync(ctx context.Context, in io.Reader, data api.Upload, options []fs.OpenOption, src fs.ObjectInfo) error {
-	originalModTime := src.ModTime(ctx)
-	metadata, err := json.Marshal(map[string]any{"data": data})
+type uploadRecord struct {
+	Version    int       // Version identifies the journal schema.
+	ID         api.ID    // ID identifies the unfinished media item.
+	FolderID   api.ID    // FolderID identifies the destination parent.
+	Name       string    // Name is the encoded destination filename.
+	Size       int64     // Size is the expected content length.
+	Modified   time.Time // Modified is the source modification time.
+	Source     string    // Source identifies the source configuration, root, and path.
+	HashType   string    // HashType identifies the source checksum algorithm.
+	Hash       string    // Hash verifies the source content against the upload input.
+	Processing bool      // Processing indicates all bytes are accepted, awaiting validation and metadata.
+}
+
+type uploadJournalOp struct {
+	key    string
+	record *uploadRecord
+	write  bool
+	remove bool
+	items  map[api.ID]*uploadRecord
+}
+
+func (op *uploadJournalOp) Do(_ context.Context, bucket kv.Bucket) error {
+	if op.items != nil {
+		return bucket.ForEach(func(_, value []byte) error {
+			var record *uploadRecord
+			if err := json.Unmarshal(value, &record); err != nil {
+				return err
+			}
+			if record == nil || record.Version != uploadJournalVersion || record.ID == "" {
+				return errors.New("invalid upload recovery record")
+			}
+			if _, found := op.items[record.ID]; found {
+				return errors.New("duplicate upload recovery ID")
+			}
+			op.items[record.ID] = record
+			return nil
+		})
+	}
+	key := []byte(op.key)
+	if op.remove {
+		return bucket.Delete(key)
+	}
+	if op.write {
+		b, err := json.Marshal(op.record)
+		if err != nil {
+			return err
+		}
+		return bucket.Put(key, b)
+	}
+	if b := bucket.Get(key); b != nil {
+		if err := json.Unmarshal(b, &op.record); err != nil {
+			return err
+		}
+		if op.record == nil {
+			return errors.New("invalid upload recovery record")
+		}
+	}
+	return nil
+}
+
+func (f *Fs) pendingUploads() (map[api.ID]*uploadRecord, error) {
+	f.uploadJournalMu.RLock()
+	defer f.uploadJournalMu.RUnlock()
+	if f.uploadJournal == nil {
+		if f.opt.ResumeUploads {
+			return nil, kv.ErrInactive
+		}
+		return nil, nil
+	}
+	op := &uploadJournalOp{items: make(map[api.ID]*uploadRecord)}
+	if err := f.uploadJournal.Do(false, op); err != nil && !errors.Is(err, kv.ErrEmpty) {
+		return nil, fmt.Errorf("read unfinished uploads: %w", err)
+	}
+	return op.items, nil
+}
+
+func (f *Fs) journalDB() *kv.DB {
+	f.uploadJournalMu.RLock()
+	defer f.uploadJournalMu.RUnlock()
+	return f.uploadJournal
+}
+
+func (f *Fs) journalDo(write bool, op kv.Op) error {
+	f.uploadJournalMu.RLock()
+	defer f.uploadJournalMu.RUnlock()
+	if f.uploadJournal == nil {
+		return kv.ErrInactive
+	}
+	return f.uploadJournal.Do(write, op)
+}
+
+func (f *Fs) stopUploadJournal() error {
+	f.uploadJournalMu.Lock()
+	defer f.uploadJournalMu.Unlock()
+	if f.uploadJournal == nil {
+		return nil
+	}
+	err := f.uploadJournal.Stop(false)
+	f.uploadJournal = nil
+	return err
+}
+
+func (f *Fs) startUploadJournal(ctx context.Context) error {
+	if !kv.Supported() {
+		return kv.ErrUnsupported
+	}
+	id, err := f.accountID(ctx)
 	if err != nil {
 		return err
 	}
-	opts := rest.Opts{Method: http.MethodPost, RootURL: o.fs.uploadURL, Path: "/upload/file", Parameters: url.Values{"action": {"save-metadata"}, "responsetime": {"true"}, "lastupdate": {"true"}}, ContentType: "application/octet-stream", Body: bytes.NewReader(metadata)}
-	reply, err := o.fs.call(ctx, opts, nil)
+	scope, _ := json.Marshal([]string{strings.TrimRight(f.opt.URL, "/"), strings.Trim(f.opt.APIPath, "/"), f.uploadURL, id})
+	digest := sha256.Sum256(scope)
+	// Remote aliases and roots share upload ownership for the same account.
+	f.uploadJournalMu.Lock()
+	defer f.uploadJournalMu.Unlock()
+	f.uploadJournal, err = kv.Start(ctx, fmt.Sprintf("onemediahub-uploads-%x", digest[:]), nil)
+	return err
+}
+
+type uploadRecovery struct {
+	fs       *Fs
+	db       *kv.DB
+	key      string
+	lock     *flock.Flock
+	record   *uploadRecord
+	previous *uploadRecord
+	source   fs.Object
+	reader   io.Reader
+	existing bool
+}
+
+func uploadSource(src fs.ObjectInfo) fs.Object {
+	// OverrideRemote changes the destination name without changing source bytes.
+	for {
+		override, ok := src.(*fs.OverrideRemote)
+		if !ok {
+			break
+		}
+		src = override.ObjectInfo
+	}
+	source, _ := src.(fs.Object)
+	return source
+}
+
+func freshUploadSource(ctx context.Context, source fs.Object, size int64, modified time.Time) (fs.Object, error) {
+	sourceFs, ok := source.Fs().(fs.Fs)
+	if !ok {
+		return nil, nil
+	}
+	fresh, err := sourceFs.NewObject(ctx, source.Remote())
 	if err != nil {
-		return fmt.Errorf("register upload metadata: %w", err)
+		return nil, fmt.Errorf("check upload source: %w", err)
 	}
-	if reply.ID == "" {
-		return errors.New("upload metadata returned no media ID")
+	if fresh.Size() != size || !fresh.ModTime(ctx).Equal(modified) {
+		return nil, errors.New("upload source changed before resuming")
 	}
-	if o.info.ID != "" && reply.ID != o.info.ID {
-		return fmt.Errorf("upload metadata returned media ID %s, expected %s", reply.ID, o.info.ID)
+	return fresh, nil
+}
+
+func bindUploadReader(ctx context.Context, in io.Reader, size int64, hashType hash.Type, expected string) (io.Reader, string, error) {
+	reader, wrap := accounting.UnWrap(in)
+	seeker, seekable := reader.(io.ReadSeeker)
+	_, stable := reader.(*os.File)
+	var buffered *accounting.Account
+	var baseOffset int64
+	if seekable {
+		var err error
+		baseOffset, err = seeker.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return in, "", nil
+		}
+	} else {
+		_, acc := accounting.UnWrapAccounting(in)
+		if acc == nil {
+			acc, _ = in.(*accounting.Account)
+		}
+		if acc == nil || acc.GetAsyncReader() == nil || reader != acc.GetAsyncReader() {
+			return in, "", nil
+		}
+		var ok bool
+		seeker, ok = acc.GetReader().(io.ReadSeeker)
+		if !ok {
+			return in, "", nil
+		}
+		if file, ok := seeker.(*os.File); ok {
+			info, err := file.Stat()
+			if err != nil {
+				return nil, "", err
+			}
+			if info.Size() != size {
+				return in, "", nil
+			}
+			stable = true
+		}
+		buffered = acc
 	}
-	o.info.ID = reply.ID
+	hasher, err := hash.NewMultiHasherTypes(hash.NewHashSet(hashType))
+	if err != nil {
+		return nil, "", err
+	}
+	n, readErr := io.Copy(hasher, readers.NewContextReader(ctx, reader))
+	if buffered != nil {
+		buffered.Abandon()
+	}
+	if readErr != nil {
+		return nil, "", fmt.Errorf("hash upload input: %w", readErr)
+	}
+	if n != size {
+		return nil, "", errors.New("upload input size does not match its source")
+	}
+	sum, err := hasher.SumString(hashType, false)
+	if err != nil {
+		return nil, "", err
+	}
+	// Some seekers reopen the source path; a mismatch must fail before rewinding.
+	if !stable && sum != expected {
+		return nil, "", errors.New("upload input content differs from its source")
+	}
+	if buffered != nil && !stable {
+		position, err := seeker.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return nil, "", err
+		}
+		if position != size {
+			return nil, "", errors.New("buffered upload input did not start at zero")
+		}
+	}
+	position, seekErr := seeker.Seek(baseOffset, io.SeekStart)
+	if seekErr != nil {
+		return nil, "", fmt.Errorf("rewind upload input: %w", seekErr)
+	}
+	if position != baseOffset {
+		return nil, "", errors.New("upload input returned an unexpected rewind position")
+	}
+	if buffered != nil {
+		buffered.SetStream(seeker)
+	}
+	return wrap(seeker), sum, nil
+}
+
+func (o *Object) prepareUploadRecovery(ctx context.Context, data api.Upload, src fs.ObjectInfo, in io.Reader) (_ *uploadRecovery, err error) {
+	db := o.fs.journalDB()
+	if db == nil {
+		if o.fs.opt.ResumeUploads {
+			return nil, kv.ErrInactive
+		}
+		return nil, nil
+	}
+	parent := string(data.FolderID)
+	if parent == "0" {
+		parent = ""
+	}
+	destination, _ := json.Marshal([]string{parent, data.Name})
+	digest := sha256.Sum256(destination)
+	r := &uploadRecovery{fs: o.fs, db: db, key: hex.EncodeToString(digest[:]), reader: in}
+	r.lock = flock.New(r.db.Path() + "." + r.key + ".lock")
+	locked, err := r.lock.TryLock()
+	contended := err == nil && !locked
+	if contended {
+		locked, err = r.lock.TryLockContext(ctx, metadataDelay)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lock upload recovery: %w", err)
+	}
+	if !locked {
+		return nil, errors.New("could not lock upload recovery")
+	}
+	defer func() {
+		if err != nil {
+			_ = r.lock.Unlock()
+		}
+	}()
+	if data.ID != "" {
+		pending, err := o.fs.pendingUploads()
+		if err != nil {
+			return nil, err
+		}
+		if record := pending[api.ID(data.ID)]; record != nil && (record.Name != data.Name || !sameParent(record.FolderID, string(data.FolderID))) {
+			return nil, errors.New("upload destination belongs to an unfinished upload at another path")
+		}
+	}
+	if contended {
+		if err := o.fs.updateMetadata(ctx, true); err != nil {
+			return nil, err
+		}
+		current, err := o.fs.newObject(ctx, o.remote, true)
+		if err != nil && !errors.Is(err, fs.ErrorObjectNotFound) {
+			return nil, err
+		}
+		if errors.Is(err, fs.ErrorObjectNotFound) && data.ID != "" {
+			return nil, fmt.Errorf("upload destination changed while waiting for recovery lock: %w", fs.ErrorObjectNotFound)
+		}
+		if err == nil && current.(*Object).ID() != data.ID {
+			return nil, errors.New("upload destination changed while waiting for recovery lock")
+		}
+	}
+	if source := uploadSource(src); source != nil && data.Size > 0 {
+		r.source, err = freshUploadSource(ctx, source, data.Size, src.ModTime(ctx))
+		if err != nil {
+			return nil, err
+		}
+	}
+	if r.source != nil {
+		for _, hashType := range []hash.Type{hash.SHA256, hash.SHA512, hash.BLAKE3, hash.MD5, hash.SHA1, hash.Whirlpool} {
+			if !r.source.Fs().Hashes().Contains(hashType) {
+				continue
+			}
+			sum, hashErr := r.source.Hash(ctx, hashType)
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if _, decodeErr := hex.DecodeString(sum); hashErr != nil || decodeErr != nil || len(sum) != hash.Width(hashType, false) {
+				continue
+			}
+			var actual string
+			r.reader, actual, err = bindUploadReader(ctx, r.reader, data.Size, hashType, sum)
+			if err != nil {
+				return nil, err
+			}
+			if actual == "" || actual != sum {
+				break
+			}
+			identity, _ := json.Marshal([]string{r.source.Fs().Name(), r.source.Fs().Root(), r.source.Remote()})
+			r.record = &uploadRecord{Version: uploadJournalVersion, FolderID: data.FolderID, Name: data.Name,
+				Size: data.Size, Modified: src.ModTime(ctx), Source: string(identity), HashType: hashType.String(), Hash: sum}
+			break
+		}
+	}
+	op := &uploadJournalOp{key: r.key}
+	if err := r.fs.journalDo(false, op); err != nil && !errors.Is(err, kv.ErrEmpty) {
+		return nil, fmt.Errorf("read upload recovery: %w", err)
+	}
+	if old := op.record; old != nil {
+		if old.Version != uploadJournalVersion || old.ID == "" {
+			return nil, errors.New("invalid upload recovery record")
+		}
+		if next := r.record; next != nil && sameParent(old.FolderID, string(next.FolderID)) && old.Name == next.Name && old.Size == next.Size &&
+			old.Modified.Equal(next.Modified) && old.Source == next.Source && old.HashType == next.HashType && old.Hash == next.Hash &&
+			(data.ID == "" || data.ID == string(old.ID)) {
+			r.record, r.existing = old, true
+		} else {
+			r.previous = old
+		}
+	}
+	if r.record == nil {
+		fs.Debugf(o, "Upload input cannot be matched to a rewindable source hash; using recovery within this attempt")
+	}
+	return r, nil
+}
+
+func (r *uploadRecovery) save() error {
+	if r == nil || r.record == nil {
+		return nil
+	}
+	if err := r.fs.journalDo(true, &uploadJournalOp{key: r.key, record: r.record, write: true}); err != nil {
+		return fmt.Errorf("save upload recovery: %w", err)
+	}
+	return nil
+}
+
+func (o *Object) completeUploadRecovery(r *uploadRecovery, data api.Upload) error {
+	if r == nil || r.record == nil {
+		return nil
+	}
+	if o.info.ID != r.record.ID || o.info.Size != data.Size || o.info.Name != data.Name ||
+		!sameParent(o.info.FolderID, string(data.FolderID)) || o.info.SoftDeleted || o.info.Status == statusDeleted || o.info.Status == "S" {
+		return errors.New("validated upload metadata does not match the recovery record")
+	}
+	if err := r.fs.journalDo(true, &uploadJournalOp{key: r.key, remove: true}); err != nil {
+		return fmt.Errorf("clear completed upload recovery: %w", err)
+	}
+	return nil
+}
+
+func (o *Object) uploadAsync(ctx context.Context, in io.Reader, data api.Upload, options []fs.OpenOption, src fs.ObjectInfo) error {
+	originalModTime := src.ModTime(ctx)
+	recovery, err := o.prepareUploadRecovery(ctx, data, src, in)
+	if err != nil {
+		return err
+	}
+	if recovery != nil {
+		defer func() { _ = recovery.lock.Unlock() }()
+		in = recovery.reader
+	}
+	var reply api.Response
+	if o.fs.opt.ResumeUploads {
+		id := api.ID(data.ID)
+		allowInvisible := recovery != nil && recovery.existing
+		if allowInvisible {
+			id = recovery.record.ID
+		} else if id == "" && recovery != nil && recovery.previous != nil {
+			id = recovery.previous.ID
+		}
+		if id != "" {
+			found := false
+			if err := o.fs.fetchMedia(ctx, []api.ID{id}, true, func(item api.Media) error {
+				if item.ID != id {
+					return errors.New("upload destination lookup returned an unexpected media ID")
+				}
+				found = true
+				if item.SoftDeleted || item.Status == statusDeleted || item.Status == "S" {
+					return errors.New("upload recovery item is deleted or in trash")
+				}
+				if item.Name != data.Name || !sameParent(item.FolderID, string(data.FolderID)) || allowInvisible && item.Size != data.Size {
+					return errors.New("upload recovery destination changed")
+				}
+				if !allowInvisible && data.ID == "" && recovery != nil && recovery.previous != nil {
+					data.ID, o.info.ID = string(item.ID), item.ID
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+			if !found && !allowInvisible && data.ID != "" {
+				return fmt.Errorf("upload replacement destination: %w", fs.ErrorObjectNotFound)
+			}
+		}
+	}
+	if recovery != nil && recovery.existing {
+		o.info.ID = recovery.record.ID
+	} else {
+		metadata, err := json.Marshal(map[string]any{"data": data})
+		if err != nil {
+			return err
+		}
+		opts := rest.Opts{Method: http.MethodPost, RootURL: o.fs.uploadURL, Path: "/upload/file", Parameters: url.Values{"action": {"save-metadata"}, "responsetime": {"true"}, "lastupdate": {"true"}}, ContentType: "application/octet-stream", Body: bytes.NewReader(metadata)}
+		reply, err = o.fs.call(ctx, opts, nil)
+		if err != nil {
+			return fmt.Errorf("register upload metadata: %w", err)
+		}
+		if reply.ID == "" {
+			return errors.New("upload metadata returned no media ID")
+		}
+		if o.info.ID != "" && reply.ID != o.info.ID {
+			return fmt.Errorf("upload metadata returned media ID %s, expected %s", reply.ID, o.info.ID)
+		}
+		o.info.ID = reply.ID
+		if recovery != nil && recovery.record != nil {
+			recovery.record.ID = reply.ID
+			if err := recovery.save(); err != nil {
+				return err
+			}
+		} else if recovery != nil && recovery.previous != nil {
+			if err := recovery.fs.journalDo(true, &uploadJournalOp{key: recovery.key, remove: true}); err != nil {
+				return fmt.Errorf("discard stale upload recovery: %w", err)
+			}
+		}
+	}
 	size := data.Size
 	if size == 0 {
 		// net/http treats an arbitrary reader with zero ContentLength as an unknown length.
 		in = http.NoBody
 	}
-	opts.Parameters = url.Values{"action": {"save"}, "lastupdate": {"true"}, "acceptasynchronous": {"true"}}
-	opts.Body = in
-	opts.ContentType = data.ContentType
-	opts.ContentLength = &size
-	opts.Options = options
-	opts.ExtraHeaders = map[string]string{"X-funambol-id": string(reply.ID), "X-funambol-file-size": strconv.FormatInt(size, 10)}
+	opts := rest.Opts{Method: http.MethodPost, RootURL: o.fs.uploadURL, Path: "/upload/file",
+		Parameters: url.Values{"action": {"save"}, "lastupdate": {"true"}, "acceptasynchronous": {"true"}},
+		Body:       in, ContentType: data.ContentType, ContentLength: &size, Options: options,
+		ExtraHeaders: map[string]string{"X-funambol-id": string(o.info.ID), "X-funambol-file-size": strconv.FormatInt(size, 10)}}
 	unwrapped, wrap := accounting.UnWrap(in)
 	seeker, canSeek := unwrapped.(io.ReadSeeker)
 	var baseOffset int64
@@ -2023,7 +2524,38 @@ func (o *Object) uploadAsync(ctx context.Context, in io.Reader, data api.Upload,
 		}
 	}()
 	var offset, available int64
-	for attempt := 0; ; attempt++ {
+	processing := recovery != nil && recovery.existing && recovery.record.Processing
+	if recovery != nil && recovery.existing && !processing {
+		// Replacement items may retain the old validated content while bytes are pending.
+		offset, err = o.uploadOffset(ctx, size)
+		if err != nil {
+			return fmt.Errorf("recover upload media %s: %w", o.info.ID, err)
+		}
+		available = offset
+		processing = offset == size
+		if processing {
+			recovery.record.Processing = true
+			if err := recovery.save(); err != nil {
+				return err
+			}
+		} else {
+			if !canSeek {
+				return errors.New("recovered upload input cannot be sought")
+			}
+			position, err := seeker.Seek(baseOffset+offset, io.SeekStart)
+			if err != nil {
+				return fmt.Errorf("seek recovered upload input: %w", err)
+			}
+			if position != baseOffset+offset {
+				return errors.New("recovered upload input returned an unexpected seek position")
+			}
+			opts.Body = wrap(seeker)
+			remaining := size - offset
+			opts.ContentLength = &remaining
+			opts.ContentRange = fmt.Sprintf("bytes %d-%d/%d", offset, size-1, size)
+		}
+	}
+	for attempt := 0; !processing; attempt++ {
 		counter := readers.NewCountingReader(opts.Body)
 		if size != 0 {
 			opts.Body = counter
@@ -2031,6 +2563,15 @@ func (o *Object) uploadAsync(ctx context.Context, in io.Reader, data api.Upload,
 		reply, err = o.fs.call(ctx, opts, nil)
 		available = max(available, offset+int64(counter.BytesRead()))
 		if err == nil {
+			if reply.ID != "" && reply.ID != o.info.ID {
+				return fmt.Errorf("upload returned media ID %s, expected %s", reply.ID, o.info.ID)
+			}
+			if recovery != nil && recovery.record != nil {
+				recovery.record.Processing = true
+				if err := recovery.save(); err != nil {
+					return err
+				}
+			}
 			break
 		}
 		if ctx.Err() != nil || attempt+1 >= max(1, fs.GetConfig(ctx).LowLevelRetries) || !fserrors.IsRetryError(err) && !fserrors.ShouldRetry(err) {
@@ -2044,18 +2585,29 @@ func (o *Object) uploadAsync(ctx context.Context, in io.Reader, data api.Upload,
 			return errors.New("upload offset exceeds bytes sent")
 		}
 		offset = confirmed
-		if source, ok := src.(fs.Object); ok {
-			if sourceFs, ok := source.Fs().(fs.Fs); ok {
-				fresh, err := sourceFs.NewObject(ctx, source.Remote())
-				if err != nil {
-					return fmt.Errorf("check upload source: %w", err)
+		if source := uploadSource(src); source != nil {
+			fresh, err := freshUploadSource(ctx, source, data.Size, originalModTime)
+			if err != nil {
+				return err
+			}
+			if fresh != nil && recovery != nil && recovery.record != nil {
+				var hashType hash.Type
+				if err := hashType.Set(recovery.record.HashType); err != nil {
+					return err
 				}
-				if fresh.Size() != data.Size || !fresh.ModTime(ctx).Equal(originalModTime) {
-					return errors.New("upload source changed before resuming")
+				sum, err := fresh.Hash(ctx, hashType)
+				if err != nil || sum != recovery.record.Hash {
+					return errors.New("upload source content changed before resuming")
 				}
 			}
 		}
 		if offset == size {
+			if recovery != nil && recovery.record != nil {
+				recovery.record.Processing = true
+				if err := recovery.save(); err != nil {
+					return err
+				}
+			}
 			break
 		}
 		if canSeek {
@@ -2089,7 +2641,10 @@ func (o *Object) uploadAsync(ctx context.Context, in io.Reader, data api.Upload,
 	if err := o.waitUpload(ctx, data.FolderID); err != nil {
 		return err
 	}
-	return o.waitMetadata(ctx)
+	if err := o.waitMetadata(ctx); err != nil {
+		return err
+	}
+	return o.completeUploadRecovery(recovery, data)
 }
 
 func (o *Object) uploadOffset(ctx context.Context, size int64) (int64, error) {
