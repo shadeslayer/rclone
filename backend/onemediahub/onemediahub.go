@@ -629,6 +629,43 @@ func (f *Fs) callRead(ctx context.Context, run pacer.Paced) error {
 
 // call checks JSON errors even on HTTP success and renews expired sessions once.
 func (f *Fs) call(ctx context.Context, opts rest.Opts, request any) (reply api.Response, err error) {
+	return f.callWithReplay(ctx, opts, request, nil)
+}
+
+func (f *Fs) callWithReplay(ctx context.Context, opts rest.Opts, request any, replay func() (io.ReadCloser, error)) (reply api.Response, err error) {
+	if replay == nil && opts.Body != nil {
+		if opts.Body == http.NoBody {
+			replay = func() (io.ReadCloser, error) { return http.NoBody, nil }
+		} else if opts.GetBody != nil {
+			replay = opts.GetBody
+		} else if reader, _ := accounting.UnWrap(opts.Body); reader != nil {
+			if seeker, ok := reader.(io.ReadSeeker); ok {
+				if start, seekErr := seeker.Seek(0, io.SeekCurrent); seekErr == nil {
+					body := opts.Body
+					replay = func() (io.ReadCloser, error) {
+						position, err := seeker.Seek(start, io.SeekStart)
+						if err != nil {
+							return nil, err
+						}
+						if position != start {
+							return nil, errors.New("upload input returned an unexpected rewind position")
+						}
+						return io.NopCloser(body), nil
+					}
+				}
+			}
+		}
+	}
+	// rest waits for the transport to stop reading a closeable request body.
+	if opts.Body != nil {
+		if opts.ContentLength == nil {
+			if body, ok := opts.Body.(interface{ Len() int }); ok {
+				length := int64(body.Len())
+				opts.ContentLength = &length
+			}
+		}
+		opts.Body = io.NopCloser(opts.Body)
+	}
 	action := opts.Parameters.Get("action")
 	readOnly := opts.Body == nil && (action == "get" || action == "get-storage-space")
 	run := func() (bool, error) {
@@ -646,8 +683,19 @@ func (f *Fs) call(ctx context.Context, opts rest.Opts, request any) (reply api.R
 			expired := (resp != nil && resp.StatusCode == http.StatusUnauthorized) || (errors.As(err, &apiErr) && apiErr.Code == invalidKeyCode)
 			if expired {
 				f.auth.invalidate(state.session)
-				if attempt == 0 && opts.Body == nil {
-					continue
+				if attempt == 0 {
+					if opts.Body == nil {
+						continue
+					}
+					if replay != nil {
+						body, replayErr := replay()
+						if replayErr != nil {
+							return false, fmt.Errorf("replay upload after session expiry: %w", replayErr)
+						}
+						defer func() { _ = body.Close() }()
+						opts.Body = body
+						continue
+					}
 				}
 			}
 			if errors.Is(err, errCloudFrontBlocked) && !readOnly {
@@ -3572,6 +3620,28 @@ func (o *Object) completeUploadRecovery(r *uploadRecovery, data api.Upload) erro
 	return nil
 }
 
+func checkUploadSource(ctx context.Context, src fs.ObjectInfo, size int64, modified time.Time, recovery *uploadRecovery) error {
+	source := uploadSource(src)
+	if source == nil {
+		return nil
+	}
+	fresh, err := freshUploadSource(ctx, source, size, modified)
+	if err != nil {
+		return err
+	}
+	if fresh != nil && recovery != nil && recovery.record != nil {
+		var hashType hash.Type
+		if err := hashType.Set(recovery.record.HashType); err != nil {
+			return err
+		}
+		sum, err := fresh.Hash(ctx, hashType)
+		if err != nil || sum != recovery.record.Hash {
+			return errors.New("upload source content changed before resuming")
+		}
+	}
+	return nil
+}
+
 func (o *Object) uploadAsync(ctx context.Context, in io.Reader, data api.Upload, options []fs.OpenOption, src fs.ObjectInfo) error {
 	originalModTime := src.ModTime(ctx)
 	recovery, err := o.prepareUploadRecovery(ctx, data, src, in)
@@ -3702,10 +3772,28 @@ func (o *Object) uploadAsync(ctx context.Context, in io.Reader, data api.Upload,
 	}
 	for attempt := 0; !processing; attempt++ {
 		counter := readers.NewCountingReader(opts.Body)
+		var replay func() (io.ReadCloser, error)
 		if size != 0 {
-			opts.Body = counter
+			opts.Body = io.NopCloser(counter)
+			if canSeek {
+				replay = func() (io.ReadCloser, error) {
+					available = max(available, offset+int64(counter.BytesRead()))
+					if err := checkUploadSource(ctx, src, data.Size, originalModTime, recovery); err != nil {
+						return nil, err
+					}
+					position, err := seeker.Seek(baseOffset+offset, io.SeekStart)
+					if err != nil {
+						return nil, err
+					}
+					if position != baseOffset+offset {
+						return nil, errors.New("upload source returned an unexpected seek position")
+					}
+					counter = readers.NewCountingReader(wrap(seeker))
+					return io.NopCloser(counter), nil
+				}
+			}
 		}
-		reply, err = o.fs.call(ctx, opts, nil)
+		reply, err = o.fs.callWithReplay(ctx, opts, nil, replay)
 		available = max(available, offset+int64(counter.BytesRead()))
 		if err == nil {
 			if reply.ID != "" && reply.ID != o.info.ID {
@@ -3730,21 +3818,8 @@ func (o *Object) uploadAsync(ctx context.Context, in io.Reader, data api.Upload,
 			return errors.New("upload offset exceeds bytes sent")
 		}
 		offset = confirmed
-		if source := uploadSource(src); source != nil {
-			fresh, err := freshUploadSource(ctx, source, data.Size, originalModTime)
-			if err != nil {
-				return err
-			}
-			if fresh != nil && recovery != nil && recovery.record != nil {
-				var hashType hash.Type
-				if err := hashType.Set(recovery.record.HashType); err != nil {
-					return err
-				}
-				sum, err := fresh.Hash(ctx, hashType)
-				if err != nil || sum != recovery.record.Hash {
-					return errors.New("upload source content changed before resuming")
-				}
-			}
+		if err := checkUploadSource(ctx, src, data.Size, originalModTime, recovery); err != nil {
+			return err
 		}
 		if offset == size {
 			if recovery != nil && recovery.record != nil {
