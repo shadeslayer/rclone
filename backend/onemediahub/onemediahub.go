@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -31,6 +32,7 @@ import (
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/batcher"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/kv"
@@ -302,17 +304,19 @@ func readOptions(m configmap.Mapper) (*options, error) {
 
 // Fs represents a OneMediaHub remote.
 type Fs struct {
-	uploadURL string
-	name      string
-	root      string
-	opt       *options
-	features  *fs.Features
-	srv       *rest.Client
-	download  *rest.Client
-	auth      *auth
-	dirCache  *dircache.DirCache
-	pacer     *fs.Pacer
-	metadata  *metadataCache
+	validation       *batcher.Batcher[validationItem, string]
+	validationCancel context.CancelFunc
+	uploadURL        string
+	name             string
+	root             string
+	opt              *options
+	features         *fs.Features
+	srv              *rest.Client
+	download         *rest.Client
+	auth             *auth
+	dirCache         *dircache.DirCache
+	pacer            *fs.Pacer
+	metadata         *metadataCache
 }
 
 // Object describes a OneMediaHub media item.
@@ -386,6 +390,16 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			_ = f.Shutdown(ctx)
 		}
 	}()
+	if opt.AsyncUpload {
+		validationCtx, cancel := context.WithCancel(context.Background())
+		f.validationCancel = cancel
+		f.validation, err = batcher.New(ctx, f, func(_ context.Context, items []validationItem, results []string, itemErrors []error) error {
+			return f.checkUploads(validationCtx, items, results, itemErrors)
+		}, batcher.Options{Mode: "sync", Size: pageSize, MaxBatchSize: pageSize, Timeout: 20 * time.Millisecond})
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	err = f.dirCache.FindRoot(ctx, false)
 	if err == nil {
@@ -875,6 +889,12 @@ func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
 
 // Shutdown closes the persistent metadata cache.
 func (f *Fs) Shutdown(ctx context.Context) error {
+	if f.validationCancel != nil {
+		f.validationCancel()
+	}
+	if f.validation != nil {
+		f.validation.Shutdown()
+	}
 	if c := f.metadata; c != nil {
 		c.refreshMu.Lock()
 		defer c.refreshMu.Unlock()
@@ -1490,31 +1510,29 @@ func (o *Object) waitUpload(ctx context.Context, folderID api.ID) error {
 	defer cancel()
 	delay := metadataDelay
 	for {
-		request := map[string]any{"ids": []map[string]string{{"id": string(o.info.ID), "folder_id": string(folderID)}}}
-		reply, err := o.fs.request(ctx, http.MethodPost, "/media", "get-validation-status", nil, request)
-		if err != nil {
-			return fmt.Errorf("check upload processing for media %s: %w", o.info.ID, err)
+		type response struct {
+			status string
+			err    error
 		}
-		var result struct {
-			IDs []struct {
-				ID     api.ID `json:"id"`
-				Status string `json:"status"`
-			} `json:"ids"`
-		}
-		if err := json.Unmarshal(reply.Data, &result); err != nil {
-			return fmt.Errorf("decode upload processing status: %w", err)
-		}
-		for _, item := range result.IDs {
-			if item.ID != o.info.ID {
-				continue
+		result := make(chan response, 1)
+		go func() {
+			status, err := o.fs.validation.Commit(ctx, string(o.info.ID), validationItem{ctx: ctx, id: o.info.ID, folderID: folderID})
+			result <- response{status, err}
+		}()
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for upload processing for media %s: %w", o.info.ID, ctx.Err())
+		case item := <-result:
+			if item.err != nil {
+				return fmt.Errorf("check upload processing for media %s: %w", o.info.ID, item.err)
 			}
-			switch item.Status {
+			switch item.status {
 			case "V":
 				return nil
 			case "U", "A":
 				// Acceptance does not guarantee the server has processed the content.
 			default:
-				return fmt.Errorf("upload processing for media %s returned status %q", o.info.ID, item.Status)
+				return fmt.Errorf("upload processing for media %s returned status %q", o.info.ID, item.status)
 			}
 		}
 		select {
@@ -1524,6 +1542,69 @@ func (o *Object) waitUpload(ctx context.Context, folderID api.ID) error {
 		}
 		delay = min(2*delay, metadataMaxDelay)
 	}
+}
+
+type validationItem struct {
+	ctx          context.Context
+	id, folderID api.ID
+}
+
+func (f *Fs) checkUploads(ctx context.Context, items []validationItem, results []string, itemErrors []error) error {
+	ctx, cancel := context.WithTimeout(ctx, metadataTimeout)
+	defer cancel()
+	var active atomic.Int32
+	var ids []map[string]string
+	for i, item := range items {
+		if itemErrors[i] = item.ctx.Err(); itemErrors[i] == nil {
+			ids = append(ids, map[string]string{"id": string(item.id), "folder_id": string(item.folderID)})
+			active.Add(1)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	for i, item := range items {
+		if itemErrors[i] != nil {
+			continue
+		}
+		stop := context.AfterFunc(item.ctx, func() {
+			if active.Add(-1) == 0 {
+				cancel()
+			}
+		})
+		defer stop()
+	}
+	reply, err := f.request(ctx, http.MethodPost, "/media", "get-validation-status", nil, map[string]any{"ids": ids})
+	if err != nil {
+		return err
+	}
+	var result struct {
+		IDs []struct {
+			ID     api.ID `json:"id"`
+			Status string `json:"status"`
+		} `json:"ids"`
+	}
+	if err := json.Unmarshal(reply.Data, &result); err != nil {
+		return fmt.Errorf("decode upload processing status: %w", err)
+	}
+	statuses := map[api.ID]string{}
+	for _, item := range result.IDs {
+		if _, exists := statuses[item.ID]; exists {
+			return errors.New("duplicate upload processing status")
+		}
+		if !slices.ContainsFunc(items, func(request validationItem) bool { return request.id == item.ID }) {
+			return errors.New("unexpected upload processing ID")
+		}
+		statuses[item.ID] = item.Status
+	}
+	for i, item := range items {
+		status, found := statuses[item.id]
+		if !found {
+			status = "U"
+		}
+		results[i], itemErrors[i] = status, item.ctx.Err()
+	}
+	return nil
 }
 
 // Remove moves the media item to the trash.

@@ -1087,6 +1087,7 @@ func TestAsyncUploadTimeoutOption(t *testing.T) {
 func TestAsyncUploadsParallel(t *testing.T) {
 	fx := newFixture(t)
 	var arrived atomic.Int32
+	var validationCalls atomic.Int32
 	ready := make(chan struct{})
 	upload := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "/sapi/upload/file", r.URL.Path)
@@ -1136,8 +1137,13 @@ func TestAsyncUploadsParallel(t *testing.T) {
 			} `json:"data"`
 		}
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
-		require.Len(t, request.Data.IDs, 1)
-		jsonReply(t, w, map[string]any{"data": map[string]any{"ids": []map[string]string{{"id": request.Data.IDs[0].ID, "status": "V"}}}})
+		validationCalls.Add(1)
+		require.Len(t, request.Data.IDs, 2)
+		var ids []map[string]string
+		for _, item := range request.Data.IDs {
+			ids = append(ids, map[string]string{"id": item.ID, "status": "V"})
+		}
+		jsonReply(t, w, map[string]any{"data": map[string]any{"ids": ids}})
 	})
 	m := fx.config(t)
 	m["async_upload"], m["upload_url"] = "true", upload.URL
@@ -1145,6 +1151,7 @@ func TestAsyncUploadsParallel(t *testing.T) {
 	defer cancel()
 	f, err := NewFs(ctx, "test", "", m)
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, f.(*Fs).Shutdown(context.Background())) })
 	errors := make(chan error, 2)
 	for _, name := range []string{"one", "two"} {
 		go func() {
@@ -1157,6 +1164,7 @@ func TestAsyncUploadsParallel(t *testing.T) {
 		require.NoError(t, <-errors)
 	}
 	assert.EqualValues(t, 2, arrived.Load())
+	assert.EqualValues(t, 1, validationCalls.Load())
 	fx.mu.Lock()
 	defer fx.mu.Unlock()
 	for _, item := range fx.media {
@@ -1175,6 +1183,9 @@ func TestAsyncUploadErrors(t *testing.T) {
 		{"wrong content ID", `{"id":42}`, `{"id":43}`, "", "expected 42"},
 		{"processing failure", `{"id":42}`, `{}`, `{"data":{"ids":[{"id":42,"status":"F"}]}}`, `returned status "F"`},
 		{"invalid status response", `{"id":42}`, `{}`, `{"data":[]}`, "decode upload processing status"},
+		{"empty status", `{"id":42}`, `{}`, `{"data":{"ids":[{"id":42,"status":""}]}}`, `returned status ""`},
+		{"duplicate status", `{"id":42}`, `{}`, `{"data":{"ids":[{"id":42,"status":"V"},{"id":42,"status":"F"}]}}`, "duplicate upload processing status"},
+		{"unexpected status ID", `{"id":42}`, `{}`, `{"data":{"ids":[{"id":43,"status":"V"}]}}`, "unexpected upload processing ID"},
 		{"accepted remains pending", `{"id":42}`, `{}`, `{"data":{"ids":[{"id":42,"status":"A"}]}}`, "context deadline exceeded"},
 		{"missing status remains pending", `{"id":42}`, `{}`, `{"data":{"ids":[]}}`, "context deadline exceeded"},
 	} {
@@ -1228,6 +1239,83 @@ func TestAsyncUploadErrors(t *testing.T) {
 				assert.Zero(t, statusCalls)
 			}
 		})
+	}
+}
+
+func TestValidationCancellation(t *testing.T) {
+	fx := newFixture(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	handler := fx.server.Config.Handler
+	fx.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("action") != "get-validation-status" {
+			handler.ServeHTTP(w, r)
+			return
+		}
+		close(started)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		jsonReply(t, w, map[string]any{"data": map[string]any{"ids": []map[string]string{{"id": "1", "status": "V"}, {"id": "2", "status": "V"}}}})
+	})
+	m := fx.config(t)
+	m["async_upload"] = "true"
+	remote, err := NewFs(context.Background(), "cancellation", "", m)
+	require.NoError(t, err)
+	f := remote.(*Fs)
+	t.Cleanup(func() { require.NoError(t, f.Shutdown(context.Background())) })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	first, second := make(chan error, 1), make(chan error, 1)
+	go func() { first <- (&Object{fs: f, info: api.Media{ID: "1"}}).waitUpload(ctx, "") }()
+	go func() { second <- (&Object{fs: f, info: api.Media{ID: "2"}}).waitUpload(context.Background(), "") }()
+	<-started
+	cancel()
+	select {
+	case err := <-first:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("cancelled upload blocked on another upload")
+	}
+	close(release)
+	select {
+	case err := <-second:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("one cancellation stopped the shared request")
+	}
+}
+
+func TestValidationShutdown(t *testing.T) {
+	fx := newFixture(t)
+	started := make(chan struct{})
+	handler := fx.server.Config.Handler
+	fx.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("action") != "get-validation-status" {
+			handler.ServeHTTP(w, r)
+			return
+		}
+		_, err := io.Copy(io.Discard, r.Body)
+		require.NoError(t, err)
+		close(started)
+		<-r.Context().Done()
+	})
+	m := fx.config(t)
+	m["async_upload"] = "true"
+	remote, err := NewFs(context.Background(), "shutdown", "", m)
+	require.NoError(t, err)
+	f := remote.(*Fs)
+	done := make(chan error, 1)
+	go func() { done <- (&Object{fs: f, info: api.Media{ID: "1"}}).waitUpload(context.Background(), "") }()
+	<-started
+	require.NoError(t, f.Shutdown(context.Background()))
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("shutdown left an upload waiting")
 	}
 }
 
