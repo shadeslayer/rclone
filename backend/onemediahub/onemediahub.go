@@ -401,7 +401,7 @@ type Fs struct {
 	uploadJournal      *kv.DB
 	uploadJournalMu    sync.RWMutex
 	flatMu             sync.Mutex
-	flatDirMu          sync.Mutex
+	flatCreates        singleflight.Group
 	flatRecords        map[api.ID]flatPathRecord
 }
 
@@ -857,7 +857,8 @@ type metadataSnapshot struct {
 }
 
 type metadataCache struct {
-	refreshMu    sync.Mutex
+	refreshing   chan struct{}
+	refreshStale bool
 	mu           sync.Mutex
 	db           *kv.DB
 	state        *metadataSnapshot
@@ -870,6 +871,9 @@ type metadataCache struct {
 	flatPaths    map[mediaKey]string
 	flatReady    bool
 	flatRevision uint64
+	invalidated  uint64
+	mediaWrites  map[api.ID]*api.Media  // Nil values record deletions during a refresh.
+	folderWrites map[api.ID]*api.Folder // Nil values record deletions during a refresh.
 }
 
 type mediaKey struct {
@@ -899,6 +903,13 @@ func (f *Fs) cacheMedia(item api.Media, remove bool) {
 	if c := f.metadata; c != nil {
 		c.mu.Lock()
 		defer c.mu.Unlock()
+		if c.mediaWrites != nil {
+			c.mediaWrites[item.ID] = &item
+			if remove {
+				c.mediaWrites[item.ID] = nil
+			}
+		}
+
 		c.dirty = true
 		if old, found := c.state.Media[item.ID]; found {
 			f.indexFlatMedia(c, old, -1)
@@ -935,6 +946,13 @@ func (f *Fs) cacheFolder(folder api.Folder, remove bool) {
 	if c := f.metadata; c != nil {
 		c.mu.Lock()
 		defer c.mu.Unlock()
+		if c.folderWrites != nil {
+			c.folderWrites[folder.ID] = &folder
+			if remove {
+				c.folderWrites[folder.ID] = nil
+			}
+		}
+
 		c.dirty = true
 		c.state.Folders = slices.DeleteFunc(c.state.Folders, func(old api.Folder) bool { return old.ID == folder.ID })
 		if !remove {
@@ -1077,33 +1095,65 @@ func (f *Fs) updateMetadata(ctx context.Context, force bool) error {
 	if c == nil {
 		return nil
 	}
-	c.refreshMu.Lock()
-	defer c.refreshMu.Unlock()
-	c.mu.Lock()
-	if force {
-		c.checked = time.Time{}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		if done := c.refreshing; done != nil {
+			// Routine refreshes can reuse the snapshot; explicit invalidation must wait.
+			ready := c.refreshStale && !c.checked.IsZero() && !force
+			c.mu.Unlock()
+			if ready {
+				return nil
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-done:
+				continue
+			}
+		}
+		done := make(chan struct{})
+		c.refreshing = done
+		c.refreshStale = c.state != nil && !c.checked.IsZero() && !force
+		if force {
+			c.checked = time.Time{}
+		}
+		c.mu.Unlock()
+		defer func() {
+			c.mu.Lock()
+			c.refreshing = nil
+			close(done)
+			c.mu.Unlock()
+		}()
+
+		foldersChanged, err := f.refreshMetadata(ctx)
+		// FindLeaf reads metadata while dircache holds its lock.
+		if foldersChanged {
+			f.dirCache.ResetRoot()
+		}
+		return err
 	}
-	foldersChanged, err := f.refreshMetadata(ctx)
-	c.mu.Unlock()
-	// FindLeaf reads metadata while dircache holds its lock.
-	if foldersChanged {
-		f.dirCache.ResetRoot()
-	}
-	return err
 }
 
 func (f *Fs) expireMetadata() {
 	if c := f.metadata; c != nil {
 		c.mu.Lock()
 		c.checked = time.Time{}
+		c.invalidated++
 		c.mu.Unlock()
 	}
 }
 
-// refreshMetadata runs with the metadata cache locked.
+// refreshMetadata fetches and saves a snapshot while local cache writes continue.
+// Only the active refresher may call this; local writes take precedence when publishing.
 func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
 	c := f.metadata
+	c.mu.Lock()
 	if !c.checked.IsZero() && time.Since(c.checked) < time.Duration(f.opt.MetadataCacheTime) {
+		c.mu.Unlock()
 		return false, nil
 	}
 	next := &metadataSnapshot{Version: metadataVersion, Media: map[api.ID]api.Media{}}
@@ -1113,13 +1163,25 @@ func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
 		next.Folders = slices.Clone(c.state.Folders)
 		next.FlatPaths = maps.Clone(c.state.FlatPaths)
 	}
+	initial, dirty, invalidated := c.state == nil, c.dirty, c.invalidated
+	indexChanged := c.byName == nil
+	previousPending := next.Pending
+	c.mediaWrites = make(map[api.ID]*api.Media)
+	c.folderWrites = make(map[api.ID]*api.Folder)
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.mediaWrites, c.folderWrites = nil, nil
+		c.mu.Unlock()
+	}()
+
 	changes, timestamp, err := f.changes(ctx, next.Anchor)
 	if err != nil {
 		return false, err
 	}
 	folderChanges := changes["folder"]
-	foldersChanged := c.state == nil || len(next.PendingFolders)+len(folderChanges.New)+len(folderChanges.Updated)+len(folderChanges.Deleted)+len(folderChanges.Locked) > 0
-	if c.state == nil {
+	foldersChanged := initial || len(next.PendingFolders)+len(folderChanges.New)+len(folderChanges.Updated)+len(folderChanges.Deleted)+len(folderChanges.Locked) > 0
+	if initial {
 		next.Folders, err = f.fetchFolders(ctx, nil)
 		if err != nil {
 			return false, err
@@ -1134,7 +1196,7 @@ func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
 			delete(ids, id)
 			next.Folders = slices.DeleteFunc(next.Folders, func(folder api.Folder) bool { return folder.ID == id })
 		}
-		if c.state == nil {
+		if initial {
 			for _, folder := range next.Folders {
 				delete(ids, folder.ID)
 			}
@@ -1167,8 +1229,7 @@ func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
 	ids := map[api.ID]struct{}{}
 	locked := map[api.ID]struct{}{}
 	changedDownloads := map[api.ID]struct{}{}
-	metadataChanged := c.state == nil || c.dirty || foldersChanged
-	indexChanged := c.byName == nil
+	metadataChanged := initial || dirty || foldersChanged
 	for _, id := range next.Pending {
 		ids[id] = struct{}{}
 	}
@@ -1224,7 +1285,7 @@ func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
 	}
 	// Unfinished uploads may not yet be visible to the metadata endpoint.
 	next.Pending = slices.Sorted(maps.Keys(ids))
-	if c.state != nil && !slices.Equal(c.state.Pending, next.Pending) {
+	if !slices.Equal(previousPending, next.Pending) {
 		metadataChanged = true
 	}
 	next.Anchor = timestamp
@@ -1233,11 +1294,39 @@ func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
 			return false, fmt.Errorf("save metadata cache: %w", err)
 		}
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	dirty = len(c.mediaWrites) != 0 || len(c.folderWrites) != 0
+	for id, item := range c.mediaWrites {
+		delete(next.Media, id)
+		if item != nil {
+			next.Media[id] = *item
+		}
+	}
+	for id, folder := range c.folderWrites {
+		next.Folders = slices.DeleteFunc(next.Folders, func(old api.Folder) bool { return old.ID == id })
+		if folder != nil {
+			next.Folders = append(next.Folders, *folder)
+		}
+	}
+	if c.state != nil {
+		if next.FlatPaths == nil {
+			next.FlatPaths = make(map[api.ID]flatPathRecord)
+		}
+		for id, record := range c.state.FlatPaths {
+			if old, found := next.FlatPaths[id]; !found || old != record {
+				next.FlatPaths[id], dirty = record, true
+			}
+		}
+	}
+	indexChanged = indexChanged || len(c.mediaWrites) != 0
+	foldersChanged = foldersChanged || len(c.folderWrites) != 0
+	metadataChanged = metadataChanged || dirty
 	for id := range changedDownloads {
 		f.downloadURLs.DeletePrefix(string(id) + "/")
 	}
 	c.state = next
-	c.dirty = false
+	c.dirty = dirty
 	if f.opt.FlatNamespace && (metadataChanged || c.flatNames == nil) {
 		c.flatReady = false
 		c.flatRevision++
@@ -1252,6 +1341,9 @@ func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
 		}
 	}
 	c.checked = time.Now()
+	if c.invalidated != invalidated {
+		c.checked = time.Time{}
+	}
 	fs.Debugf(f, "Refreshed metadata cache: fetched %d media IDs, %d pending", len(ordered), len(next.Pending))
 	return foldersChanged, nil
 }
@@ -1281,9 +1373,13 @@ func (f *Fs) Shutdown(ctx context.Context) error {
 		err = errors.Join(err, closeErr)
 	}
 	if c := f.metadata; c != nil {
-		c.refreshMu.Lock()
-		defer c.refreshMu.Unlock()
 		c.mu.Lock()
+		for c.refreshing != nil {
+			done := c.refreshing
+			c.mu.Unlock()
+			<-done
+			c.mu.Lock()
+		}
 		defer c.mu.Unlock()
 		if c.db != nil && !c.db.IsStopped() {
 			if c.dirty {
@@ -1605,8 +1701,8 @@ func (f *Fs) readFlatMapping(ctx context.Context, item api.Media, records map[ap
 // flatMappings validates referenced remote mappings without holding the metadata lock.
 func (f *Fs) flatMappings(ctx context.Context, items []api.Media) (map[mediaKey]string, error) {
 	f.flatMu.Lock()
-	defer f.flatMu.Unlock()
 	records := maps.Clone(f.flatRecords)
+	f.flatMu.Unlock()
 	if records == nil {
 		records = make(map[api.ID]flatPathRecord)
 	}
@@ -1684,7 +1780,7 @@ func (f *Fs) flatMappings(ctx context.Context, items []api.Media) (map[mediaKey]
 			}
 		}
 	}
-	f.flatRecords = records
+	f.saveFlatRecords(records)
 	if c := f.metadata; c != nil {
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -1808,6 +1904,32 @@ func (f *Fs) ensureFlatNamespace(ctx context.Context) error {
 	}
 }
 
+func (f *Fs) saveFlatRecords(records map[api.ID]flatPathRecord) {
+	f.flatMu.Lock()
+	defer f.flatMu.Unlock()
+	if f.flatRecords == nil {
+		f.flatRecords = make(map[api.ID]flatPathRecord)
+	}
+	maps.Copy(f.flatRecords, records)
+}
+
+// flatCreate coordinates only callers creating the same physical name.
+func (f *Fs) flatCreate(ctx context.Context, name, full string, create func() error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	result := f.flatCreates.DoChan(name, func() (any, error) { return full, create() })
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case result := <-result:
+		if result.Err == nil && result.Val != full {
+			return errors.New("flat namespace name conflicts with another path")
+		}
+		return result.Err
+	}
+}
+
 // ensureFlatMapping publishes and validates the immutable mapping before any hashed media.
 func (f *Fs) ensureFlatMapping(ctx context.Context, full string) error {
 	name, err := flatName(full, false)
@@ -1821,12 +1943,14 @@ func (f *Fs) ensureFlatMapping(ctx context.Context, full string) error {
 	if len(payload) > flatMappingLimit {
 		return errors.New("flat path mapping exceeds its size limit")
 	}
-	f.flatMu.Lock()
-	defer f.flatMu.Unlock()
-	if f.flatRecords == nil {
-		f.flatRecords = make(map[api.ID]flatPathRecord)
-	}
-	name = flatMappingName(full)
+	return f.flatCreate(ctx, flatMappingName(full), full, func() error {
+		return f.writeFlatMapping(ctx, full, payload)
+	})
+}
+
+func (f *Fs) writeFlatMapping(ctx context.Context, full string, payload []byte) error {
+	records := make(map[api.ID]flatPathRecord)
+	name := flatMappingName(full)
 	var items []api.Media
 	var ready bool
 	var revision uint64
@@ -1849,7 +1973,7 @@ func (f *Fs) ensureFlatMapping(ctx context.Context, full string) error {
 		}
 		for _, item := range items {
 			if record, found := c.state.FlatPaths[item.ID]; found {
-				f.flatRecords[item.ID] = record
+				records[item.ID] = record
 			}
 		}
 		c.mu.Unlock()
@@ -1861,6 +1985,17 @@ func (f *Fs) ensureFlatMapping(ctx context.Context, full string) error {
 	}); err != nil {
 		return err
 	}
+	f.flatMu.Lock()
+	for _, item := range items {
+		if _, found := records[item.ID]; found {
+			continue
+		}
+
+		if record, found := f.flatRecords[item.ID]; found {
+			records[item.ID] = record
+		}
+	}
+	f.flatMu.Unlock()
 	created := len(items) == 0
 	if created {
 		o := &Object{fs: f, remote: full, flatMapping: true}
@@ -1871,7 +2006,7 @@ func (f *Fs) ensureFlatMapping(ctx context.Context, full string) error {
 		items = append(items, o.info)
 	}
 	for _, item := range items {
-		remote, err := f.readFlatMapping(ctx, item, f.flatRecords)
+		remote, err := f.readFlatMapping(ctx, item, records)
 		if err != nil {
 			return err
 		}
@@ -1879,6 +2014,7 @@ func (f *Fs) ensureFlatMapping(ctx context.Context, full string) error {
 			return errors.New("flat path mapping names a different destination")
 		}
 	}
+	f.saveFlatRecords(records)
 	if c := f.metadata; c != nil {
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -1890,10 +2026,10 @@ func (f *Fs) ensureFlatMapping(ctx context.Context, full string) error {
 		}
 		for _, item := range items {
 			current, found := c.state.Media[item.ID]
-			if !found || !flatRecordMatches(f.flatRecords[item.ID], current) {
+			if !found || !flatRecordMatches(records[item.ID], current) {
 				return errors.New("flat path mapping changed while publishing")
 			}
-			c.state.FlatPaths[item.ID] = f.flatRecords[item.ID]
+			c.state.FlatPaths[item.ID] = records[item.ID]
 			c.flatPaths[f.mediaKey(item)] = full
 			c.dirty = true
 		}
@@ -2150,9 +2286,6 @@ func (f *Fs) projectFlatTree(ctx context.Context, items []api.Media, pending map
 }
 
 func (f *Fs) flatMkdir(ctx context.Context, full string) error {
-	// Concurrent creators otherwise cause O2 to append a number to the marker name.
-	f.flatDirMu.Lock()
-	defer f.flatDirMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -2192,16 +2325,40 @@ func (f *Fs) flatMkdir(ctx context.Context, full string) error {
 	}
 	// Check every ancestor before creating anything, then create parents first.
 	for _, full := range slices.Backward(missing) {
-		if err := f.ensureFlatMapping(ctx, full); err != nil {
-			return err
-		}
-		o := &Object{fs: f, remote: full, flatDirectory: true}
-		src := object.NewStaticObjectInfo(full, time.Now(), 0, true, nil, f).WithMimeType("application/octet-stream")
-		if err := o.Update(ctx, strings.NewReader(""), src); err != nil {
+		name, _ := flatName(full, true)
+		if err := f.flatCreate(ctx, name, full, func() error { return f.writeFlatDir(ctx, full, name) }); err != nil {
 			return fmt.Errorf("create flat directory marker: %w", err)
 		}
 	}
 	return nil
+}
+
+func (f *Fs) writeFlatDir(ctx context.Context, full, name string) error {
+	// Recheck after earlier creators finish so O2 cannot number a duplicate marker.
+	file, _ := flatName(full, false)
+	if _, err := f.objectByName(ctx, full, file, f.opt.RootFolderID, nil); err == nil {
+		return fs.ErrorIsFile
+	} else if !errors.Is(err, fs.ErrorObjectNotFound) {
+		return err
+	}
+	marker, err := f.objectByName(ctx, full, name, f.opt.RootFolderID, nil)
+	if err == nil {
+		if marker.Size() != 0 {
+			return errors.New("nonempty flat directory marker")
+		}
+		return nil
+	}
+
+	if !errors.Is(err, fs.ErrorObjectNotFound) {
+		return err
+	}
+
+	if err := f.ensureFlatMapping(ctx, full); err != nil {
+		return err
+	}
+	o := &Object{fs: f, remote: full, flatDirectory: true}
+	src := object.NewStaticObjectInfo(full, time.Now(), 0, true, nil, f).WithMimeType("application/octet-stream")
+	return o.Update(ctx, strings.NewReader(""), src)
 }
 
 func (f *Fs) flatRmdir(ctx context.Context, dir string) error {
