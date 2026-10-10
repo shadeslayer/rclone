@@ -875,6 +875,7 @@ type metadataCache struct {
 	invalidated  uint64
 	mediaWrites  map[api.ID]*api.Media  // Nil values record deletions during a refresh.
 	folderWrites map[api.ID]*api.Folder // Nil values record deletions during a refresh.
+	indexWrites  map[*metadataCache]map[api.ID]*api.Media
 }
 
 type mediaKey struct {
@@ -915,33 +916,52 @@ func (f *Fs) cacheMedia(item api.Media, remove bool) {
 			}
 		}
 
-		c.dirty = true
-		if old, found := c.state.Media[item.ID]; found {
-			f.indexFlatMedia(c, old, -1)
+		var current *api.Media
+		if !remove {
+			current = &item
 		}
-		if f.opt.FlatNamespace && (isFlatMapping(item.Name) || isFlatMapping(c.state.Media[item.ID].Name)) {
-			c.flatReady = false
-			c.flatRevision++
+		for _, writes := range c.indexWrites {
+			writes[item.ID] = current
 		}
-		if old, ok := c.state.Media[item.ID]; ok && (remove || f.mediaKey(old) != f.mediaKey(item)) {
-			key := f.mediaKey(old)
-			if c.byName[key] == item.ID {
-				delete(c.byName, key)
-				for id, other := range c.state.Media {
-					if id != item.ID && !other.IsDeleted() && f.mediaKey(other) == key && id > c.byName[key] {
-						c.byName[key] = id
-					}
+		f.applyMedia(c, item.ID, current)
+	}
+}
+
+// applyMedia updates a snapshot and its indexes; a nil item removes the ID.
+func (f *Fs) applyMedia(c *metadataCache, id api.ID, item *api.Media) {
+	c.dirty = true
+	old, found := c.state.Media[id]
+	if found {
+		f.indexFlatMedia(c, old, -1)
+	}
+
+	if f.opt.FlatNamespace && (isFlatMapping(old.Name) || item != nil && isFlatMapping(item.Name)) {
+		c.flatReady = false
+		c.flatRevision++
+	}
+
+	if c.byName != nil && found && (item == nil || f.mediaKey(old) != f.mediaKey(*item)) {
+		key := f.mediaKey(old)
+		if c.byName[key] == id {
+			delete(c.byName, key)
+			for otherID, other := range c.state.Media {
+				if otherID != id && !other.IsDeleted() && f.mediaKey(other) == key && otherID > c.byName[key] {
+					c.byName[key] = otherID
 				}
 			}
 		}
-		delete(c.state.Media, item.ID)
-		if !remove {
-			c.state.Media[item.ID] = item
-			f.indexFlatMedia(c, item, 1)
-			key := f.mediaKey(item)
-			if item.ID >= c.byName[key] {
-				c.byName[key] = item.ID
-			}
+	}
+	delete(c.state.Media, id)
+	if item == nil {
+		return
+	}
+
+	c.state.Media[id] = *item
+	f.indexFlatMedia(c, *item, 1)
+	if c.byName != nil {
+		key := f.mediaKey(*item)
+		if id >= c.byName[key] {
+			c.byName[key] = id
 		}
 	}
 }
@@ -1170,6 +1190,7 @@ func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
 	}
 	initial, dirty, invalidated := c.state == nil, c.dirty, c.invalidated
 	indexChanged := c.byName == nil
+	flatMissing := c.flatNames == nil
 	previousPending := next.Pending
 	c.mediaWrites = make(map[api.ID]*api.Media)
 	c.folderWrites = make(map[api.ID]*api.Folder)
@@ -1299,14 +1320,27 @@ func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
 			return false, fmt.Errorf("save metadata cache: %w", err)
 		}
 	}
+	// Build on the private snapshot, then replay writes made during the refresh.
+	built := &metadataCache{state: next}
+	if f.opt.FlatNamespace && (metadataChanged || flatMissing) {
+		f.rebuildFlatIndex(built)
+	}
+
+	if indexChanged {
+		built.byName = make(map[mediaKey]api.ID, len(next.Media))
+		for id, item := range next.Media {
+			key := f.mediaKey(item)
+			if !item.IsDeleted() && id >= built.byName[key] {
+				built.byName[key] = id
+			}
+		}
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	dirty = len(c.mediaWrites) != 0 || len(c.folderWrites) != 0
+	dirty = built.dirty || len(c.mediaWrites) != 0 || len(c.folderWrites) != 0
 	for id, item := range c.mediaWrites {
-		delete(next.Media, id)
-		if item != nil {
-			next.Media[id] = *item
-		}
+		f.applyMedia(built, id, item)
 	}
 	for id, folder := range c.folderWrites {
 		next.Folders = slices.DeleteFunc(next.Folders, func(old api.Folder) bool { return old.ID == id })
@@ -1319,12 +1353,15 @@ func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
 			next.FlatPaths = make(map[api.ID]flatPathRecord)
 		}
 		for id, record := range c.state.FlatPaths {
+			if item, found := next.Media[id]; !found || item.IsDeleted() || !flatRecordMatches(record, item) {
+				continue
+			}
+
 			if old, found := next.FlatPaths[id]; !found || old != record {
 				next.FlatPaths[id], dirty = record, true
 			}
 		}
 	}
-	indexChanged = indexChanged || len(c.mediaWrites) != 0
 	foldersChanged = foldersChanged || len(c.folderWrites) != 0
 	metadataChanged = metadataChanged || dirty
 	for id := range changedDownloads {
@@ -1332,18 +1369,17 @@ func (f *Fs) refreshMetadata(ctx context.Context) (bool, error) {
 	}
 	c.state = next
 	c.dirty = dirty
-	if f.opt.FlatNamespace && (metadataChanged || c.flatNames == nil) {
+	if built.flatNames != nil {
+		c.flatNames, c.flatDirs, c.flatBad, c.flatPaths = built.flatNames, built.flatDirs, built.flatBad, built.flatPaths
+	}
+
+	if f.opt.FlatNamespace && (metadataChanged || flatMissing) {
 		c.flatReady = false
 		c.flatRevision++
-		f.rebuildFlatIndex(c)
 	}
-	if indexChanged {
-		c.byName = make(map[mediaKey]api.ID, len(next.Media))
-		for _, id := range slices.Sorted(maps.Keys(next.Media)) {
-			if item := next.Media[id]; !item.IsDeleted() {
-				c.byName[f.mediaKey(item)] = id
-			}
-		}
+
+	if built.byName != nil {
+		c.byName = built.byName
 	}
 	c.checked = time.Now()
 	if c.invalidated != invalidated {
@@ -1784,58 +1820,98 @@ func (f *Fs) flatMappings(ctx context.Context, items []api.Media) (map[mediaKey]
 		}
 	}
 	f.saveFlatRecords(records)
-	if c := f.metadata; c != nil {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		if c.state.FlatPaths == nil {
-			c.state.FlatPaths = make(map[api.ID]flatPathRecord)
-		}
-		for id, record := range records {
-			if item, found := c.state.Media[id]; found && flatRecordMatches(record, item) {
-				if old, found := c.state.FlatPaths[id]; !found || old != record {
-					c.state.FlatPaths[id], c.dirty = record, true
-				}
-			}
-		}
-		f.rebuildFlatIndex(c)
-		c.flatReady = true
-		currentReferences := maps.Clone(references)
-		for _, item := range c.state.Media {
-			if !sameParent(item.FolderID, f.opt.RootFolderID) || item.IsDeleted() {
-				continue
-			}
-			if digest, _, mapping, ok := parseFlatHashName(f.mediaKey(item).name); ok && !mapping {
-				key := f.mediaKey(item)
-				currentReferences[mediaKey{parent: key.parent, name: flatPrefix + "p-" + digest}] = true
-				if _, _, err := f.resolvedFlatName(f.mediaKey(item), c.flatPaths); err != nil {
-					c.flatReady = false
-				}
-			}
-		}
-		counts := make(map[mediaKey]int)
-		for _, item := range c.state.Media {
-			key := f.mediaKey(item)
-			if !currentReferences[key] || item.IsDeleted() {
-				continue
-			}
-			counts[key]++
-			if !slices.ContainsFunc(mappings[key], func(old api.Media) bool {
-				return old.ID == item.ID && old.Name == item.Name && old.FolderID == item.FolderID && old.ETag == item.ETag &&
-					old.Size == item.Size && old.Modified == item.Modified && old.Date == item.Date
-			}) {
-				c.flatReady = false
-			}
-		}
-		for key := range currentReferences {
-			if counts[key] != len(mappings[key]) {
-				c.flatReady = false
-			}
-		}
-		if !c.flatReady {
-			return paths, errFlatMappingChanged
+	if f.metadata != nil {
+		if err := f.cacheFlatMappings(records, mappings, references); err != nil {
+			return paths, err
 		}
 	}
 	return paths, nil
+}
+
+func (f *Fs) cacheFlatMappings(records map[api.ID]flatPathRecord, mappings map[mediaKey][]api.Media, references map[mediaKey]bool) error {
+	c := f.metadata
+	c.mu.Lock()
+	state, revision := c.state, c.flatRevision
+	built := &metadataCache{state: &metadataSnapshot{
+		Media: maps.Clone(state.Media), FlatPaths: maps.Clone(state.FlatPaths),
+	}}
+	writes := make(map[api.ID]*api.Media)
+	if c.indexWrites == nil {
+		c.indexWrites = make(map[*metadataCache]map[api.ID]*api.Media)
+	}
+	c.indexWrites[built] = writes
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		delete(c.indexWrites, built)
+		c.mu.Unlock()
+	}()
+
+	if built.state.FlatPaths == nil {
+		built.state.FlatPaths = make(map[api.ID]flatPathRecord)
+	}
+	for id, record := range records {
+		if item, found := built.state.Media[id]; found && flatRecordMatches(record, item) {
+			if old, found := built.state.FlatPaths[id]; !found || old != record {
+				built.state.FlatPaths[id], built.dirty = record, true
+			}
+		}
+	}
+	f.rebuildFlatIndex(built)
+
+	valid := make(map[mediaKey]bool, len(mappings))
+	for key, candidates := range mappings {
+		valid[key] = built.flatNames[key] == len(candidates)
+		for _, old := range candidates {
+			item, found := built.state.Media[old.ID]
+			if !found || item.IsDeleted() || old.Name != item.Name || old.FolderID != item.FolderID || old.ETag != item.ETag ||
+				old.Size != item.Size || old.Modified != item.Modified || old.Date != item.Date {
+				valid[key] = false
+			}
+		}
+	}
+	built.flatReady = true
+	for key := range references {
+		built.flatReady = built.flatReady && valid[key]
+	}
+	for _, item := range built.state.Media {
+		built.flatReady = f.validFlatMedia(built, item, valid) && built.flatReady
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// Mapping changes require revalidation; ordinary uploads can be replayed cheaply.
+	if c.state != state || c.flatRevision != revision {
+		return errFlatMappingChanged
+	}
+	for id, item := range writes {
+		f.applyMedia(built, id, item)
+		if item != nil {
+			built.flatReady = f.validFlatMedia(built, *item, valid) && built.flatReady
+		}
+	}
+	c.state.FlatPaths = built.state.FlatPaths
+	c.dirty = c.dirty || built.dirty
+	c.flatNames, c.flatDirs, c.flatBad, c.flatPaths = built.flatNames, built.flatDirs, built.flatBad, built.flatPaths
+	c.flatReady = built.flatReady
+	c.flatRevision++
+	if !c.flatReady {
+		return errFlatMappingChanged
+	}
+	return nil
+}
+
+func (f *Fs) validFlatMedia(c *metadataCache, item api.Media, mappings map[mediaKey]bool) bool {
+	if !sameParent(item.FolderID, f.opt.RootFolderID) || item.IsDeleted() {
+		return true
+	}
+	key := f.mediaKey(item)
+	digest, _, mapping, ok := parseFlatHashName(key.name)
+	if !ok || mapping {
+		return true
+	}
+	_, _, err := f.resolvedFlatName(key, c.flatPaths)
+	return err == nil && mappings[mediaKey{parent: key.parent, name: flatPrefix + "p-" + digest}]
 }
 
 func (f *Fs) resolvedFlatName(key mediaKey, paths map[mediaKey]string) (remote string, directory bool, err error) {
@@ -2040,6 +2116,7 @@ func (f *Fs) writeFlatMapping(ctx context.Context, full string, payload []byte) 
 		if created && ready && c.flatRevision == revision+1 {
 			c.flatReady = true
 		}
+		c.flatRevision++
 	}
 	return nil
 }
@@ -2103,7 +2180,7 @@ func (f *Fs) flatPath(remote string) (string, error) {
 }
 
 // indexFlatMedia maintains directory reference counts alongside the raw name index.
-// The metadata lock must be held, and delta is 1 for addition or -1 for removal.
+// The cache must be private or locked; delta is 1 for addition or -1 for removal.
 func (f *Fs) indexFlatMedia(c *metadataCache, item api.Media, delta int) {
 	if c.flatNames == nil || item.IsDeleted() {
 		return
@@ -2137,22 +2214,31 @@ func (f *Fs) indexFlatMedia(c *metadataCache, item api.Media, delta int) {
 	}
 }
 
-func (f *Fs) objectPath(ctx context.Context, remote string, create bool) (leaf, parent string, err error) {
+type pathMode uint8
+
+const (
+	pathLookup pathMode = iota
+	pathCreate
+	pathUpload
+)
+
+func (f *Fs) objectPath(ctx context.Context, remote string, mode pathMode) (leaf, parent string, missing []string, err error) {
 	if !f.opt.FlatNamespace {
-		return f.dirCache.FindPath(ctx, remote, create)
+		leaf, parent, err = f.dirCache.FindPath(ctx, remote, mode != pathLookup)
+		return
 	}
 	full, err := f.flatPath(remote)
 	if err != nil {
-		return "", "", err
+		return "", "", nil, err
 	}
 	leaf, err = flatName(full, false)
 	if err != nil {
-		return "", "", err
+		return "", "", nil, err
 	}
 	if err := f.ensureFlatNamespace(ctx); err != nil {
-		return "", "", err
+		return "", "", nil, err
 	}
-	if create {
+	if mode != pathLookup {
 		var directory bool
 		if c := f.metadata; c != nil {
 			parent := f.opt.RootFolderID
@@ -2164,27 +2250,36 @@ func (f *Fs) objectPath(ctx context.Context, remote string, create bool) (leaf, 
 			directory = c.flatDirs[mediaKey{parent: parent, name: full}] != 0
 			c.mu.Unlock()
 			if bad {
-				return "", "", errors.New("invalid or unsupported flat namespace metadata")
+				return "", "", nil, errors.New("invalid or unsupported flat namespace metadata")
 			}
 		} else {
 			tree, err := f.flatTree(ctx)
 			if err != nil && !errors.Is(err, fs.ErrorDirNotFound) {
-				return "", "", err
+				return "", "", nil, err
 			}
 			_, directory = tree[remote]
 		}
 		if directory {
-			return "", "", fs.ErrorIsDir
+			return "", "", nil, fs.ErrorIsDir
 		}
 		parent, _ := dircache.SplitPath(full)
-		if err := f.flatMkdir(ctx, parent); err != nil {
-			return "", "", err
+		missing, err = f.flatDirs(ctx, parent)
+		if err != nil {
+			return "", "", nil, err
 		}
+
+		if mode == pathCreate {
+			if err := f.makeFlatDirs(ctx, missing); err != nil {
+				return "", "", nil, err
+			}
+			missing = nil
+		}
+
 		if err := f.ensureFlatMapping(ctx, full); err != nil {
-			return "", "", err
+			return "", "", nil, err
 		}
 	}
-	return leaf, f.opt.RootFolderID, nil
+	return leaf, f.opt.RootFolderID, missing, nil
 }
 
 func (f *Fs) flatTree(ctx context.Context) (dirtree.DirTree, error) {
@@ -2292,44 +2387,57 @@ func (f *Fs) projectFlatTree(ctx context.Context, items []api.Media, pending map
 }
 
 func (f *Fs) flatMkdir(ctx context.Context, full string) error {
-	if err := ctx.Err(); err != nil {
+	missing, err := f.flatDirs(ctx, full)
+	if err != nil {
 		return err
 	}
+	return f.makeFlatDirs(ctx, missing)
+}
+
+// flatDirs checks every ancestor before an upload can publish any content.
+func (f *Fs) flatDirs(ctx context.Context, full string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := f.ensureFlatNamespace(ctx); err != nil {
-		return err
+		return nil, err
 	}
 	pending, err := f.pendingUploads()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var missing []string
 	for full != "" {
 		file, err := flatName(full, false)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		for _, record := range pending {
 			if sameParent(record.FolderID, f.opt.RootFolderID) && f.uploadKey(record).name == file {
-				return fs.ErrorIsFile
+				return nil, fs.ErrorIsFile
 			}
 		}
 		if _, err := f.objectByName(ctx, full, file, f.opt.RootFolderID, nil); err == nil {
-			return fs.ErrorIsFile
+			return nil, fs.ErrorIsFile
 		} else if !errors.Is(err, fs.ErrorObjectNotFound) {
-			return err
+			return nil, err
 		}
 		name, _ := flatName(full, true)
 		marker, err := f.objectByName(ctx, full, name, f.opt.RootFolderID, nil)
 		if errors.Is(err, fs.ErrorObjectNotFound) {
 			missing = append(missing, full)
 		} else if err != nil {
-			return err
+			return nil, err
 		} else if marker.Size() != 0 {
-			return errors.New("nonempty flat directory marker")
+			return nil, errors.New("nonempty flat directory marker")
 		}
 		full, _ = dircache.SplitPath(full)
 	}
-	// Check every ancestor before creating anything, then create parents first.
+	return missing, nil
+}
+
+func (f *Fs) makeFlatDirs(ctx context.Context, missing []string) error {
+	// Parent markers preserve empty directories after their children are removed.
 	for _, full := range slices.Backward(missing) {
 		name, _ := flatName(full, true)
 		if err := f.flatCreate(ctx, name, full, func() error { return f.writeFlatDir(ctx, full, name) }); err != nil {
@@ -2847,7 +2955,7 @@ func (f *Fs) newObject(ctx context.Context, remote string, includePending bool) 
 			return nil, err
 		}
 	}
-	leaf, parent, err := f.objectPath(ctx, remote, false)
+	leaf, parent, _, err := f.objectPath(ctx, remote, pathLookup)
 	if errors.Is(err, fs.ErrorDirNotFound) {
 		return nil, fs.ErrorObjectNotFound
 	}
@@ -3131,7 +3239,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	if !errors.Is(err, fs.ErrorObjectNotFound) {
 		return nil, err
 	}
-	leaf, parent, err := f.objectPath(ctx, remote, true)
+	leaf, parent, _, err := f.objectPath(ctx, remote, pathCreate)
 	if err != nil {
 		return nil, err
 	}
@@ -3831,17 +3939,39 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return err
 	}
 	var leaf, parent string
+	var missing []string
 	if o.flatMapping {
 		leaf, parent = flatMappingName(o.remote), o.fs.opt.RootFolderID
 	} else if o.flatDirectory {
 		leaf, err = flatName(o.remote, true)
 		parent = o.fs.opt.RootFolderID
 	} else {
-		leaf, parent, err = o.fs.objectPath(ctx, o.remote, true)
+		leaf, parent, missing, err = o.fs.objectPath(ctx, o.remote, pathUpload)
 	}
 	if err != nil {
 		return err
 	}
+	if len(missing) != 0 {
+		// Flat files use the physical root, so marker creation can overlap their content.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		done := make(chan error, 1)
+		go func() {
+			err := o.fs.makeFlatDirs(ctx, missing)
+			if err != nil {
+				cancel()
+			}
+			done <- err
+		}()
+		defer func() {
+			if err != nil {
+				cancel()
+			}
+			err = errors.Join(err, <-done)
+			cancel()
+		}()
+	}
+
 	originalModTime := src.ModTime(ctx)
 	modified := originalModTime.UTC().Format(dateFormat)
 	data := api.Upload{ID: string(o.info.ID), FolderID: api.ID(parent), Name: o.fs.opt.Enc.FromStandardName(leaf), Size: src.Size(), ContentType: fs.MimeType(ctx, src), Created: modified, Modified: modified}

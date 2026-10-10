@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"runtime/pprof"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,12 +17,202 @@ import (
 	"time"
 
 	"github.com/rclone/rclone/backend/onemediahub/api"
+	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/object"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 const concurrencyTimeout = 5 * time.Second
+
+func TestMetadataIndexAllowsWrites(t *testing.T) {
+	const entries = 200000
+	for _, mode := range []string{"refresh", "mapping"} {
+		t.Run(mode, func(t *testing.T) {
+			fx := newFlatFixture(t)
+			f, ctx := flatTestFs(t, fx, "", true)
+			c := f.metadata
+			require.NoError(t, c.db.Stop(false))
+			c.db = nil
+			for i := range entries {
+				id := api.ID(strconv.Itoa(i))
+				item := api.Media{ID: id, FolderID: "1", Name: flatFixtureName("bulk/"+string(id), false), Type: "file", Size: 1}
+				c.state.Media[id] = item
+				c.byName[f.mediaKey(item)] = id
+			}
+			for _, id := range []api.ID{"rename", "delete", "duplicate-a", "duplicate-z"} {
+				name := string(id)
+				if strings.HasPrefix(name, "duplicate-") {
+					name = "duplicate"
+				}
+				f.cacheMedia(api.Media{ID: id, FolderID: "1", Name: flatFixtureName(name+"/file.txt", false), Type: "file", Size: 1}, false)
+			}
+			f.rebuildFlatIndex(c)
+			if mode == "refresh" {
+				c.byName = nil // Force both indexes to rebuild during refresh.
+			}
+			c.checked = time.Now().Add(-time.Duration(f.opt.MetadataCacheTime))
+			c.dirty = true
+			items := slices.Collect(maps.Values(c.state.Media))
+			result := make(chan error, 1)
+			go func() {
+				if mode == "refresh" {
+					result <- f.syncMetadata(ctx)
+					return
+				}
+
+				_, err := f.flatMappings(ctx, items)
+				result <- err
+			}()
+			deadline := time.After(concurrencyTimeout)
+			for {
+				var stacks bytes.Buffer
+				require.NoError(t, pprof.Lookup("goroutine").WriteTo(&stacks, 2))
+				if bytes.Contains(stacks.Bytes(), []byte("onemediahub.(*Fs).rebuildFlatIndex")) {
+					break
+				}
+
+				select {
+				case err := <-result:
+					t.Fatalf("index rebuild was not observed: %v", err)
+				case <-deadline:
+					t.Fatal("index rebuild did not start")
+				case <-time.After(time.Millisecond):
+				}
+			}
+			unlocked := c.mu.TryLock()
+			if unlocked {
+				c.mu.Unlock()
+			}
+			assert.True(t, unlocked, "index construction held the metadata mutex")
+			item := api.Media{ID: "during-build", FolderID: "1", Name: flatFixtureName("concurrent/file.txt", false), Type: "file", Size: 1}
+			f.cacheMedia(item, false)
+			renamed := item
+			renamed.ID = "rename"
+			f.cacheMedia(renamed, false)
+			f.cacheMedia(api.Media{ID: "delete"}, true)
+			f.cacheMedia(api.Media{ID: "duplicate-z"}, true)
+			waitConcurrent(t, result)
+			assert.Equal(t, item, c.state.Media[item.ID])
+			assert.Equal(t, renamed.ID, c.byName[f.mediaKey(item)])
+			assert.Equal(t, renamed, c.state.Media[renamed.ID])
+			assert.NotContains(t, c.state.Media, api.ID("delete"))
+			assert.NotContains(t, c.flatDirs, mediaKey{parent: "1", name: "delete"})
+			assert.NotContains(t, c.flatDirs, mediaKey{parent: "1", name: "rename"})
+			assert.Equal(t, api.ID("duplicate-a"), c.byName[mediaKey{parent: "1", name: flatFixtureName("duplicate/file.txt", false)}])
+			assert.Equal(t, 2, c.flatDirs[mediaKey{parent: "1", name: "concurrent"}])
+		})
+	}
+}
+
+func TestFlatUploadOverlapsMarkers(t *testing.T) {
+	for _, cached := range []bool{false, true} {
+		for _, async := range []bool{false, true} {
+			t.Run("cached="+strconv.FormatBool(cached)+"/async="+strconv.FormatBool(async), func(t *testing.T) {
+				fx := newFlatFixture(t)
+				uploadSourceFixture(t, fx)
+				f, ctx := flatTestFs(t, fx, "", cached, configmap.Simple{"async_upload": strconv.FormatBool(async)})
+				marker, releaseMarker := gateRequest(t, fx, func(r *http.Request, body []byte) bool {
+					return strings.HasPrefix(r.URL.Path, "/sapi/upload") && bytes.Contains(body, []byte(flatFixtureName("parent", true)))
+				})
+				defer releaseMarker()
+				content, releaseContent := gateRequest(t, fx, func(r *http.Request, body []byte) bool {
+					return strings.HasPrefix(r.URL.Path, "/sapi/upload") && r.URL.Query().Get("action") == "save" && bytes.Contains(body, []byte("payload"))
+				})
+				defer releaseContent()
+				result := make(chan error, 1)
+				go func() {
+					src := object.NewStaticObjectInfo("parent/file.txt", time.Now(), 7, true, nil, f)
+					_, err := f.Put(ctx, strings.NewReader("payload"), src)
+					result <- err
+				}()
+				select {
+				case <-marker:
+				case <-time.After(concurrencyTimeout):
+					t.Fatal("marker upload did not start")
+				}
+				select {
+				case <-content:
+				case <-time.After(concurrencyTimeout):
+					t.Error("file content waited for its parent marker")
+					releaseMarker()
+					select {
+					case <-content:
+					case <-time.After(concurrencyTimeout):
+						t.Fatal("file upload did not start")
+					}
+				}
+				select {
+				case err := <-result:
+					t.Fatalf("upload returned before its requests finished: %v", err)
+				default:
+				}
+				releaseContent()
+				select {
+				case err := <-result:
+					t.Fatalf("upload returned before its marker finished: %v", err)
+				case <-time.After(100 * time.Millisecond):
+				}
+				releaseMarker()
+				waitConcurrent(t, result)
+				entries, err := f.List(ctx, "parent")
+				require.NoError(t, err)
+				assert.Equal(t, []string{"parent/file.txt"}, flatEntryNames(entries))
+			})
+		}
+	}
+}
+
+func TestFlatUploadMarkerFailure(t *testing.T) {
+	for _, async := range []bool{false, true} {
+		t.Run(strconv.FormatBool(async), func(t *testing.T) {
+			fx := newFlatFixture(t)
+			uploadSourceFixture(t, fx)
+			fx.wrapHandler(func(next http.Handler) http.Handler {
+				return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					body, err := io.ReadAll(r.Body)
+					require.NoError(t, err)
+					require.NoError(t, r.Body.Close())
+					r.Body = io.NopCloser(bytes.NewReader(body))
+					if strings.HasPrefix(r.URL.Path, "/sapi/upload") && bytes.Contains(body, []byte(flatFixtureName("parent", true))) {
+						jsonReply(t, w, map[string]any{"error": map[string]string{"code": "COM-1011", "message": "marker failed"}})
+						return
+					}
+					next.ServeHTTP(w, r)
+				})
+			})
+			f, ctx := flatTestFs(t, fx, "", true, configmap.Simple{"async_upload": strconv.FormatBool(async)})
+			marker, release := gateRequest(t, fx, func(r *http.Request, body []byte) bool {
+				return strings.HasPrefix(r.URL.Path, "/sapi/upload") && bytes.Contains(body, []byte(flatFixtureName("parent", true)))
+			})
+			defer release()
+			result := make(chan error, 1)
+			go func() {
+				src := object.NewStaticObjectInfo("parent/file.txt", time.Now(), 7, true, nil, f)
+				_, err := f.Put(ctx, strings.NewReader("payload"), src)
+				result <- err
+			}()
+			select {
+			case <-marker:
+			case <-time.After(concurrencyTimeout):
+				t.Fatal("marker upload did not start")
+			}
+			require.Eventually(t, func() bool {
+				f.metadata.mu.Lock()
+				defer f.metadata.mu.Unlock()
+				id := f.metadata.byName[mediaKey{parent: "1", name: flatFixtureName("parent/file.txt", false)}]
+				return id != ""
+			}, concurrencyTimeout, time.Millisecond)
+			release()
+			select {
+			case err := <-result:
+				require.ErrorContains(t, err, "marker failed")
+			case <-time.After(concurrencyTimeout):
+				t.Fatal("failed marker did not finish the upload")
+			}
+		})
+	}
+}
 
 func gateRequest(t *testing.T, fx *flatFixture, match func(*http.Request, []byte) bool) (<-chan struct{}, func()) {
 	t.Helper()
