@@ -14,6 +14,8 @@ import (
 	"sync"
 
 	"github.com/rclone/rclone/fs"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 )
 
 // DirCache caches paths to directory IDs and vice versa
@@ -21,20 +23,28 @@ type DirCache struct {
 	cacheMu  sync.RWMutex // protects cache and invCache
 	cache    map[string]string
 	invCache map[string]string
+	rootID   string // protected by cacheMu so FindLeaf can update its alias
 
-	mu           sync.Mutex // protects the below
-	fs           DirCacher  // Interface to find and make directories
-	trueRootID   string     // ID of the absolute root
-	root         string     // the path the cache is rooted on
-	rootID       string     // ID of the root directory
-	rootParentID string     // ID of the root's parent directory
-	foundRoot    bool       // Whether we have found the root or not
+	pendingMu sync.Mutex
+	pending   map[dirKey]chan struct{}
+
+	mu           sync.RWMutex // protects root resolution and the below
+	fs           DirCacher    // Interface to find and make directories
+	trueRootID   string       // ID of the absolute root
+	root         string       // the path the cache is rooted on
+	rootParentID string       // ID of the root's parent directory
+	foundRoot    bool         // Whether we have found the root or not
+}
+
+type dirKey struct {
+	parent string
+	name   string
 }
 
 // DirCacher describes an interface for doing the low level directory work
 //
 // This should be implemented by the backend and will be called by the
-// dircache package when appropriate.
+// dircache package when appropriate. Calls for distinct directories may overlap.
 type DirCacher interface {
 	FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut string, found bool, err error)
 	CreateDir(ctx context.Context, pathID, leaf string) (newID string, err error)
@@ -65,6 +75,8 @@ func New(root string, trueRootID string, fs DirCacher) *DirCache {
 
 // String returns the directory cache in string form for debugging
 func (dc *DirCache) String() string {
+	dc.mu.RLock()
+	defer dc.mu.RUnlock()
 	dc.cacheMu.RLock()
 	defer dc.cacheMu.RUnlock()
 	var buf bytes.Buffer
@@ -135,9 +147,51 @@ func (dc *DirCache) Flush() {
 // backends use "0" as a root ID, but it has a real ID which is needed
 // for some operations.
 func (dc *DirCache) SetRootIDAlias(rootID string) {
-	// No locking as this is called from FindLeaf
+	dc.cacheMu.Lock()
+	defer dc.cacheMu.Unlock()
 	dc.rootID = rootID
-	dc.Put("", dc.rootID)
+	dc.cache[""] = rootID
+	dc.invCache[rootID] = ""
+}
+
+func (dc *DirCache) getRootID() string {
+	dc.cacheMu.RLock()
+	defer dc.cacheMu.RUnlock()
+	return dc.rootID
+}
+
+// lockDir coordinates aliases of one directory while unrelated requests proceed.
+func (dc *DirCache) lockDir(ctx context.Context, key dirKey) (func(), error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		dc.pendingMu.Lock()
+		done := dc.pending[key]
+		if done == nil {
+			done = make(chan struct{})
+			if dc.pending == nil {
+				dc.pending = make(map[dirKey]chan struct{})
+			}
+
+			dc.pending[key] = done
+			dc.pendingMu.Unlock()
+			return func() {
+				dc.pendingMu.Lock()
+				delete(dc.pending, key)
+				close(done)
+				dc.pendingMu.Unlock()
+			}, nil
+		}
+
+		dc.pendingMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-done:
+		}
+	}
 }
 
 // FlushDir flushes the map of all data starting with the path
@@ -196,22 +250,28 @@ func SplitPath(path string) (directory, leaf string) {
 //
 // It will call FindRoot if it hasn't been called already
 func (dc *DirCache) FindDir(ctx context.Context, path string, create bool) (pathID string, err error) {
-	dc.mu.Lock()
-	defer dc.mu.Unlock()
-	err = dc._findRoot(ctx, create)
-	if err != nil {
-		return "", err
+	for {
+		dc.mu.RLock()
+		if dc.foundRoot {
+			pathID, err = dc._findDir(ctx, path, create)
+			dc.mu.RUnlock()
+			return pathID, err
+		}
+
+		dc.mu.RUnlock()
+		if err := dc.FindRoot(ctx, create); err != nil {
+			return "", err
+		}
 	}
-	return dc._findDir(ctx, path, create)
 }
 
 // Unlocked findDir
 //
-// Call with a lock on mu
+// Call with a read or write lock on mu.
 func (dc *DirCache) _findDir(ctx context.Context, path string, create bool) (pathID string, err error) {
 	// If it is the root, then return it
 	if path == "" {
-		return dc.rootID, nil
+		return dc.getRootID(), nil
 	}
 
 	// If it is in the cache then return it
@@ -227,7 +287,21 @@ func (dc *DirCache) _findDir(ctx context.Context, path string, create bool) (pat
 	parentPathID, err := dc._findDir(ctx, directory, create)
 	if err != nil {
 		return "", err
+	}
 
+	// Fold only the lock key; backends still receive the original name.
+	key := dirKey{parent: parentPathID, name: norm.NFC.String(cases.Fold().String(leaf))}
+	if directory == "" || parentPathID == dc.getRootID() {
+		key.parent = "" // Keep the root's lock identity stable when its ID is aliased.
+	}
+
+	unlock, err := dc.lockDir(ctx, key)
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
+	if pathID, ok := dc.Get(path); ok {
+		return pathID, nil
 	}
 
 	// Find the leaf in parentPathID
@@ -307,7 +381,6 @@ func (dc *DirCache) _findRoot(ctx context.Context, create bool) error {
 		return err
 	}
 	dc.foundRoot = true
-	dc.rootID = rootID
 
 	// Find the parent of the root while we still have the root
 	// directory tree cached
@@ -317,14 +390,14 @@ func (dc *DirCache) _findRoot(ctx context.Context, create bool) error {
 	// Reset the tree based on dc.root
 	dc.Flush()
 	// Put the root directory in
-	dc.Put("", dc.rootID)
+	dc.SetRootIDAlias(rootID)
 	return nil
 }
 
 // FoundRoot returns whether the root directory has been found yet
 func (dc *DirCache) FoundRoot() bool {
-	dc.mu.Lock()
-	defer dc.mu.Unlock()
+	dc.mu.RLock()
+	defer dc.mu.RUnlock()
 	return dc.foundRoot
 }
 
@@ -332,13 +405,7 @@ func (dc *DirCache) FoundRoot() bool {
 //
 // If create is set it will make the root directory if not found
 func (dc *DirCache) RootID(ctx context.Context, create bool) (ID string, err error) {
-	dc.mu.Lock()
-	defer dc.mu.Unlock()
-	err = dc._findRoot(ctx, create)
-	if err != nil {
-		return "", err
-	}
-	return dc.rootID, nil
+	return dc.FindDir(ctx, "", create)
 }
 
 // RootParentID returns the ID of the parent of the root directory
@@ -358,7 +425,7 @@ func (dc *DirCache) RootParentID(ctx context.Context, create bool) (ID string, e
 			return "", err
 		}
 		dc.rootParentID = rootParentID
-	} else if dc.rootID == dc.trueRootID {
+	} else if dc.getRootID() == dc.trueRootID {
 		return "", errors.New("is root directory")
 	}
 	return dc.rootParentID, nil
@@ -372,11 +439,8 @@ func (dc *DirCache) ResetRoot() {
 	dc.foundRoot = false
 	dc.Flush()
 
-	// Put the true root in
-	dc.rootID = dc.trueRootID
-
 	// Put the root directory in
-	dc.Put("", dc.rootID)
+	dc.SetRootIDAlias(dc.trueRootID)
 }
 
 // DirMove prepares to move the directory (srcDC, srcRoot, srcRemote)
