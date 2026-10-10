@@ -388,14 +388,122 @@ func TestFlatProviderNumberedDirectoryMarkers(t *testing.T) {
 	}
 }
 
+func TestFlatProviderFileCopies(t *testing.T) {
+	for _, cached := range []bool{false, true} {
+		for _, remote := range []string{"project/file.bin", "project/" + strings.Repeat("long", 60) + ".bin"} {
+			for _, suffix := range []string{"", " (1)"} {
+				t.Run(fmt.Sprintf("cached=%v/long=%v/suffix=%q", cached, len(flatFixtureName(remote, false)) > flatNameLimit, suffix), func(t *testing.T) {
+					fx := newFlatFixture(t)
+					fx.nextID = 100
+					name, err := flatName(remote, false)
+					require.NoError(t, err)
+					fx.media = []api.Media{
+						{ID: "10", FolderID: "1", Name: name, Type: "file", Size: 5, URL: fx.server.URL + "/content/10"},
+						{ID: "11", FolderID: "1", Name: name + suffix, Type: "file", Size: 6, URL: fx.server.URL + "/content/11"},
+					}
+					fx.content["10"], fx.content["11"] = "first", "second"
+					if strings.Contains(name, "-f-h-") {
+						body := flatMappingFixture(t, remote)
+						fx.media = append(fx.media, api.Media{ID: "12", FolderID: "1", Name: flatMappingName(remote), Type: "file", Size: int64(len(body)), URL: fx.server.URL + "/content/12"})
+						fx.content["12"] = string(body)
+					}
+
+					f, ctx := flatTestFs(t, fx, "project", cached)
+					logical := strings.TrimPrefix(remote, "project/")
+					entries, err := f.List(ctx, "")
+					require.NoError(t, err)
+					assert.Equal(t, []string{logical, logical}, flatEntryNames(entries))
+					assert.True(t, f.Features().DuplicateFiles)
+					_, err = f.NewObject(ctx, logical)
+					require.ErrorContains(t, err, "duplicate")
+					src := object.NewStaticObjectInfo(logical, time.Now(), 1, true, nil, f)
+					_, err = f.Put(ctx, strings.NewReader("x"), src)
+					require.ErrorContains(t, err, "duplicate")
+
+					var listed fs.DirEntries
+					require.NoError(t, f.ListR(ctx, "", func(entries fs.DirEntries) error {
+						listed = append(listed, entries...)
+						return nil
+					}))
+					var copies int
+					for _, entry := range listed {
+						obj, ok := entry.(*Object)
+						if !ok {
+							continue
+						}
+
+						copies++
+						body, err := obj.Open(ctx)
+						require.NoError(t, err)
+						content, err := io.ReadAll(body)
+						require.NoError(t, err)
+						require.NoError(t, body.Close())
+						assert.Equal(t, fx.content[obj.info.ID], string(content))
+						if obj.ID() == "10" {
+							require.NoError(t, obj.Remove(ctx))
+						}
+					}
+					assert.Equal(t, 2, copies)
+					obj, err := f.NewObject(ctx, logical)
+					require.NoError(t, err)
+					assert.Equal(t, "11", obj.(*Object).ID())
+					src = object.NewStaticObjectInfo(logical, time.Now(), 7, true, nil, f)
+					require.NoError(t, obj.Update(ctx, strings.NewReader("updated"), src))
+					assert.Equal(t, "11", obj.(*Object).ID())
+					assert.Equal(t, name+suffix, obj.(*Object).info.Name)
+					require.NoError(t, obj.Remove(ctx))
+					assert.Zero(t, fx.folderWrites.Load())
+				})
+			}
+		}
+	}
+}
+
+func TestFlatProviderMappingCopies(t *testing.T) {
+	for _, cached := range []bool{false, true} {
+		t.Run(strconv.FormatBool(cached), func(t *testing.T) {
+			fx := newFlatFixture(t)
+			fx.nextID = 100
+			remote := "project/" + strings.Repeat("long", 60) + ".bin"
+			body := flatMappingFixture(t, remote)
+			fx.media = []api.Media{
+				{ID: "10", FolderID: "1", Name: flatHashedFixtureName(remote, "f-h") + " (2)", Type: "file", Size: 5, URL: fx.server.URL + "/content/10"},
+				{ID: "11", FolderID: "1", Name: flatMappingName(remote), Type: "file", Size: int64(len(body)), URL: fx.server.URL + "/content/11"},
+				{ID: "12", FolderID: "1", Name: flatMappingName(remote) + " (1)", Type: "file", Size: int64(len(body)), URL: fx.server.URL + "/content/12"},
+			}
+			fx.content["10"], fx.content["11"], fx.content["12"] = "hello", string(body), string(body)
+			f, ctx := flatTestFs(t, fx, "", cached)
+			entries, err := f.List(ctx, path.Dir(remote))
+			require.NoError(t, err)
+			assert.Equal(t, []string{remote}, flatEntryNames(entries))
+			obj, err := f.NewObject(ctx, remote)
+			require.NoError(t, err)
+			src := object.NewStaticObjectInfo(remote, time.Now(), 7, true, nil, f)
+			require.NoError(t, obj.Update(ctx, strings.NewReader("updated"), src))
+			fx.mu.Lock()
+			var mappings int
+			for _, item := range fx.media {
+				if strings.HasPrefix(item.Name, flatPrefix+"p-") {
+					mappings++
+				}
+			}
+			fx.mu.Unlock()
+			assert.Equal(t, 2, mappings)
+		})
+	}
+}
+
 func TestFlatProviderAliasesFailClosed(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		size int64
 	}{
 		{flatFixtureName("empty", true) + " (1)", 1},
-		{flatFixtureName("file", false) + " (1)", 0},
-		{flatMappingName(strings.Repeat("long/", 20)) + " (1)", 0},
+		{flatMappingName(strings.Repeat("long/", 20)) + " (01)", 0},
+		{flatFixtureName("file", false) + " (0)", 1},
+		{flatFixtureName("file", false) + " (01)", 1},
+		{flatFixtureName("file", false) + " (1) (2)", 1},
+		{flatFixtureName(strings.Repeat("a", 146), false) + " (10)", 1},
 		{flatFixtureName("empty", true) + " (0)", 0},
 		{flatFixtureName("empty", true) + " (01)", 0},
 		{flatFixtureName("empty", true) + " (1) (2)", 0},
@@ -633,7 +741,6 @@ func TestFlatConflictsAndMarkerIntegrity(t *testing.T) {
 		name, root string
 		items      []api.Media
 	}{
-		{"duplicate-file", "", []api.Media{{ID: "10", Name: flatFixtureName("a.txt", false)}, {ID: "11", Name: flatFixtureName("a.txt", false)}}},
 		{"file-and-marker", "", []api.Media{{ID: "10", Name: flatFixtureName("a", false)}, {ID: "11", Name: flatFixtureName("a", true)}}},
 		{"file-and-descendant", "", []api.Media{{ID: "10", Name: flatFixtureName("a", false)}, {ID: "11", Name: flatFixtureName("a/b/c.txt", false)}}},
 		{"nonempty-marker", "", []api.Media{{ID: "10", Name: flatFixtureName("project", true), Size: 1}}},
@@ -1123,6 +1230,7 @@ func TestFlatMappingValidationFailsClosed(t *testing.T) {
 		name, body string
 		missing    bool
 		duplicate  bool
+		suffix     string
 	}{
 		{name: "missing", missing: true},
 		{name: "malformed-json", body: "{"},
@@ -1135,6 +1243,7 @@ func TestFlatMappingValidationFailsClosed(t *testing.T) {
 		{name: "trailing-json", body: valid + "{}"},
 		{name: "oversized", body: strings.Repeat("x", (1<<20)+1)},
 		{name: "corrupt-duplicate-mapping", body: valid, duplicate: true},
+		{name: "corrupt-numbered-mapping", body: valid, duplicate: true, suffix: " (1)"},
 	} {
 		for _, cached := range []bool{false, true} {
 			t.Run(tc.name+"/"+strconv.FormatBool(cached), func(t *testing.T) {
@@ -1147,7 +1256,7 @@ func TestFlatMappingValidationFailsClosed(t *testing.T) {
 				}
 				if tc.duplicate {
 					other := string(flatMappingFixture(t, "other/"+strings.Repeat("x", 4096)+".bin"))
-					fx.media = append(fx.media, api.Media{ID: "12", FolderID: "1", Name: flatHashedFixtureName(remote, "p"), Type: "file", Size: int64(len(other)), URL: fx.server.URL + "/content/12"})
+					fx.media = append(fx.media, api.Media{ID: "12", FolderID: "1", Name: flatHashedFixtureName(remote, "p") + tc.suffix, Type: "file", Size: int64(len(other)), URL: fx.server.URL + "/content/12"})
 					fx.content["12"] = other
 				}
 				f, ctx := flatTestFs(t, fx, "", cached)
@@ -1201,6 +1310,18 @@ func TestFlatLongMappingsSurviveCacheRestart(t *testing.T) {
 	assert.Equal(t, mappingDownloads, fx.requests["/content/11"], "restart must reuse the validated immutable mapping")
 	assert.Zero(t, fx.requests["/sapi/upload"])
 	assert.Zero(t, fx.requests["/sapi/upload/file"])
+	fx.media[0].Name += " (1)"
+	fx.media[1].Name += " (1)"
+	fx.changes = map[string]api.Changes{"file": {Updated: []api.ID{"10", "11"}}}
+	fx.mu.Unlock()
+	run()
+	fx.mu.Lock()
+	assert.Equal(t, mappingDownloads+1, fx.requests["/content/11"])
+	fx.changes = map[string]api.Changes{}
+	fx.mu.Unlock()
+	run()
+	fx.mu.Lock()
+	assert.Equal(t, mappingDownloads+1, fx.requests["/content/11"], "restart must reuse the validated numbered mapping")
 	fx.mu.Unlock()
 }
 
@@ -1307,20 +1428,23 @@ func TestFlatConcurrentMappingValidationFailsClosed(t *testing.T) {
 }
 
 func TestFlatLongPendingUploadProtectsOnlyItsDirectory(t *testing.T) {
-	for _, cached := range []bool{false, true} {
-		t.Run(strconv.FormatBool(cached), func(t *testing.T) {
+	for _, test := range []struct {
+		cached bool
+		suffix string
+	}{{false, ""}, {true, ""}, {false, " (1)"}, {true, " (1)"}} {
+		t.Run(fmt.Sprintf("cached=%v/suffix=%q", test.cached, test.suffix), func(t *testing.T) {
 			fx := newFlatFixture(t)
 			remote := "visible/" + strings.Repeat("x", 4096) + ".txt"
 			body := flatMappingFixture(t, remote)
 			fx.media = []api.Media{
 				{ID: "41", FolderID: "1", Name: flatFixtureName("visible", true), Type: "file"},
 				{ID: "43", FolderID: "1", Name: flatFixtureName("unrelated", true), Type: "file"},
-				{ID: "44", FolderID: "1", Name: flatHashedFixtureName(remote, "p"), Type: "file", Size: int64(len(body)), URL: fx.server.URL + "/content/44"},
+				{ID: "44", FolderID: "1", Name: flatHashedFixtureName(remote, "p") + test.suffix, Type: "file", Size: int64(len(body)), URL: fx.server.URL + "/content/44"},
 			}
 			fx.content["44"] = string(body)
-			f, ctx := flatTestFs(t, fx, "", cached, configmap.Simple{"async_upload": "true", "resume_uploads": "true"})
+			f, ctx := flatTestFs(t, fx, "", test.cached, configmap.Simple{"async_upload": "true", "resume_uploads": "true"})
 			source, _ := recoverySource(t)
-			r, err := (&Object{fs: f, remote: remote}).prepareUploadRecovery(ctx, api.Upload{FolderID: "1", Name: flatHashedFixtureName(remote, "f-h"), Size: 6}, source, strings.NewReader("abcdef"))
+			r, err := (&Object{fs: f, remote: remote}).prepareUploadRecovery(ctx, api.Upload{FolderID: "1", Name: flatHashedFixtureName(remote, "f-h") + test.suffix, Size: 6}, source, strings.NewReader("abcdef"))
 			require.NoError(t, err)
 			r.record.ID = "42"
 			require.NoError(t, r.save())
@@ -1340,7 +1464,7 @@ func TestFlatLongPendingUploadProtectsOnlyItsDirectory(t *testing.T) {
 			assert.Empty(t, entries, "retained sidecar does not create a logical file or directory")
 			fx.mu.Lock()
 			assert.Len(t, fx.media, 1)
-			assert.Equal(t, flatHashedFixtureName(remote, "p"), fx.media[0].Name)
+			assert.Equal(t, flatHashedFixtureName(remote, "p")+test.suffix, fx.media[0].Name)
 			assert.Equal(t, string(body), fx.content["44"])
 			assert.Zero(t, fx.requests["/sapi/upload"])
 			assert.Zero(t, fx.requests["/sapi/upload/file"])

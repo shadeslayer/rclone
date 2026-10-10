@@ -224,7 +224,7 @@ func init() {
 			},
 			{
 				Name:     "flat_namespace",
-				Help:     "Store files under encoded full-path names in one physical folder to avoid the server's folder-count limit. Directories are virtual; empty directories use marker files. Long paths require small immutable mapping files, retained after removal and hidden from rclone. O2's apps display encoded names and mapping files. Only files written with this option are visible; existing files are not migrated. Set root_folder_id to an existing folder, or leave it empty to use unfiled media. Use metadata_cache and --fast-list for large trees.",
+				Help:     "Store files under encoded full-path names in one physical folder to avoid the server's folder-count limit. Directories are virtual; empty directories use marker files. Long paths require small immutable mapping files, retained after removal and hidden from rclone. O2's apps display encoded names and mapping files. Provider-numbered file copies remain visible as duplicates; use rclone dedupe to resolve them. Only files written with this option are visible; existing files are not migrated. Set root_folder_id to an existing folder, or leave it empty to use unfiled media. Use metadata_cache and --fast-list for large trees.",
 				Default:  false,
 				Advanced: true,
 			},
@@ -451,6 +451,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 	if opt.FlatNamespace {
 		f.features.DirMove = nil
+		f.features.DuplicateFiles = true
 		if f.root != "" && !validFlatPath(f.root) {
 			return nil, errors.New("flat namespace root must be a relative path without empty, dot or parent components")
 		}
@@ -887,12 +888,16 @@ func (f *Fs) mediaKey(item api.Media) mediaKey {
 		parent = ""
 	}
 	name := f.opt.Enc.ToStandardName(item.Name)
-	if f.opt.FlatNamespace && item.Size == 0 {
-		if canonical, ok := flatDirectoryAlias(name); ok {
+	if f.opt.FlatNamespace {
+		if canonical, directory, ok := flatAlias(name); ok && (!directory || item.Size == 0) {
 			name = canonical
 		}
 	}
 	return mediaKey{parent: parent, name: name}
+}
+
+func (f *Fs) uploadKey(record *uploadRecord) mediaKey {
+	return f.mediaKey(api.Media{FolderID: record.FolderID, Name: record.Name, Size: record.Size})
 }
 
 func (f *Fs) cacheMedia(item api.Media, remove bool) {
@@ -1661,7 +1666,7 @@ func (f *Fs) readFlatMapping(ctx context.Context, item api.Media, records map[ap
 	if item.IsDeleted() || item.Size <= 0 || item.Size > flatMappingLimit {
 		return "", errors.New("invalid flat path mapping media")
 	}
-	name := f.opt.Enc.ToStandardName(item.Name)
+	name := f.mediaKey(item).name
 	if record, found := records[item.ID]; found && flatRecordMatches(record, item) {
 		if remote, err := flatPayloadPath(record.flatPathPayload, name); err == nil {
 			return remote, nil
@@ -1724,7 +1729,7 @@ func (f *Fs) flatMappings(ctx context.Context, items []api.Media) (map[mediaKey]
 		digest, _, mapping, ok := parseFlatHashName(key.name)
 		if !ok {
 			if strings.HasPrefix(key.name, "rclone-flat-") {
-				return nil, fmt.Errorf("invalid or unsupported flat namespace name for media %s", item.ID)
+				return nil, fmt.Errorf("invalid or unsupported flat namespace name %q for media %s", item.Name, item.ID)
 			}
 			continue
 		}
@@ -1743,12 +1748,10 @@ func (f *Fs) flatMappings(ctx context.Context, items []api.Media) (map[mediaKey]
 		if !sameParent(record.FolderID, f.opt.RootFolderID) {
 			continue
 		}
-		if digest, _, mapping, ok := parseFlatHashName(f.opt.Enc.ToStandardName(record.Name)); ok && !mapping {
-			parent := string(record.FolderID)
-			if parent == "0" {
-				parent = ""
-			}
-			references[mediaKey{parent: parent, name: flatPrefix + "p-" + digest}] = true
+		key := f.uploadKey(record)
+		if digest, _, mapping, ok := parseFlatHashName(key.name); ok && !mapping {
+			key.name = flatPrefix + "p-" + digest
+			references[key] = true
 		}
 	}
 	paths := make(map[mediaKey]string)
@@ -1978,7 +1981,7 @@ func (f *Fs) writeFlatMapping(ctx context.Context, full string, payload []byte) 
 		}
 		c.mu.Unlock()
 	} else if err := f.media(ctx, nil, func(item api.Media) error {
-		if sameParent(item.FolderID, f.opt.RootFolderID) && f.opt.Enc.ToStandardName(item.Name) == name {
+		if sameParent(item.FolderID, f.opt.RootFolderID) && f.mediaKey(item).name == name {
 			items = append(items, item)
 		}
 		return ctx.Err()
@@ -2056,29 +2059,34 @@ func parseFlatName(name string) (remote string, directory, ok bool) {
 	return string(b), encoded[0] == 'd', true
 }
 
-// flatDirectoryAlias recognizes provider-numbered copies of canonical directory markers.
-func flatDirectoryAlias(name string) (string, bool) {
+// flatAlias recognizes provider-numbered copies without guessing truncated names.
+func flatAlias(name string) (canonical string, directory, ok bool) {
 	// A name at the provider limit may have a truncated, but still decodable, base.
 	if len(name) >= flatNameLimit || !strings.HasSuffix(name, ")") {
-		return "", false
+		return "", false, false
 	}
+
 	i := strings.LastIndex(name, " (")
 	if i < 0 {
-		return "", false
+		return "", false, false
 	}
+
 	number := name[i+2 : len(name)-1]
 	n, err := strconv.ParseUint(number, 10, 64)
 	if err != nil || n == 0 || strconv.FormatUint(n, 10) != number {
-		return "", false
+		return "", false, false
 	}
-	canonical := name[:i]
-	if _, directory, ok := parseFlatName(canonical); ok && directory {
-		return canonical, true
+
+	canonical = name[:i]
+	if _, directory, ok := parseFlatName(canonical); ok {
+		return canonical, directory, true
 	}
-	if _, directory, mapping, ok := parseFlatHashName(canonical); ok && directory && !mapping {
-		return canonical, true
+
+	if _, directory, _, ok := parseFlatHashName(canonical); ok {
+		return canonical, directory, true
 	}
-	return "", false
+
+	return "", false, false
 }
 
 func (f *Fs) flatPath(remote string) (string, error) {
@@ -2230,7 +2238,7 @@ func (f *Fs) projectFlatTree(ctx context.Context, items []api.Media, pending map
 		}
 		full, directory, err := f.resolvedFlatName(f.mediaKey(item), paths)
 		if err != nil {
-			return nil, fmt.Errorf("invalid or unsupported flat namespace name for media %s: %w", item.ID, err)
+			return nil, fmt.Errorf("invalid or unsupported flat namespace name %q for media %s: %w", item.Name, item.ID, err)
 		}
 		if directory && item.Size != 0 {
 			return nil, fmt.Errorf("nonempty flat directory marker for media %s", item.ID)
@@ -2254,10 +2262,8 @@ func (f *Fs) projectFlatTree(ctx context.Context, items []api.Media, pending map
 				dirs[remote] = true
 			}
 		} else {
-			if _, found := files[remote]; found {
-				return nil, fmt.Errorf("duplicate flat namespace file for media %s", item.ID)
-			}
 			files[remote] = item.ID
+			// List every copy so dedupe can resolve it by media ID.
 			tree.Add(&Object{fs: f, remote: remote, info: item})
 		}
 	}
@@ -2303,7 +2309,7 @@ func (f *Fs) flatMkdir(ctx context.Context, full string) error {
 			return err
 		}
 		for _, record := range pending {
-			if sameParent(record.FolderID, f.opt.RootFolderID) && record.Name == f.opt.Enc.FromStandardName(file) {
+			if sameParent(record.FolderID, f.opt.RootFolderID) && f.uploadKey(record).name == file {
 				return fs.ErrorIsFile
 			}
 		}
@@ -2382,10 +2388,7 @@ func (f *Fs) flatRmdir(ctx context.Context, dir string) error {
 		if !sameParent(record.FolderID, f.opt.RootFolderID) {
 			continue
 		}
-		key := mediaKey{parent: string(record.FolderID), name: f.opt.Enc.ToStandardName(record.Name)}
-		if key.parent == "0" {
-			key.parent = ""
-		}
+		key := f.uploadKey(record)
 		var remote string
 		var decodeErr error
 		if c := f.metadata; c != nil {
@@ -2396,8 +2399,9 @@ func (f *Fs) flatRmdir(ctx context.Context, dir string) error {
 			f.flatMu.Lock()
 			paths := make(map[mediaKey]string)
 			for _, mapping := range f.flatRecords {
-				if path, err := flatPayloadPath(mapping.flatPathPayload, f.opt.Enc.ToStandardName(mapping.Name)); err == nil {
-					paths[mediaKey{parent: key.parent, name: f.opt.Enc.ToStandardName(mapping.Name)}] = path
+				mappingKey := f.mediaKey(api.Media{FolderID: mapping.FolderID, Name: mapping.Name, Size: mapping.Size})
+				if path, err := flatPayloadPath(mapping.flatPathPayload, mappingKey.name); err == nil {
+					paths[mappingKey] = path
 				}
 			}
 			remote, _, decodeErr = f.resolvedFlatName(key, paths)
@@ -3137,7 +3141,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}
 	name := f.opt.Enc.FromStandardName(leaf)
 	for _, record := range pending {
-		if record.Name == name && sameParent(record.FolderID, parent) {
+		if f.uploadKey(record).name == leaf && sameParent(record.FolderID, parent) {
 			return nil, errors.New("move destination has an unfinished upload")
 		}
 	}
@@ -3841,6 +3845,11 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	originalModTime := src.ModTime(ctx)
 	modified := originalModTime.UTC().Format(dateFormat)
 	data := api.Upload{ID: string(o.info.ID), FolderID: api.ID(parent), Name: o.fs.opt.Enc.FromStandardName(leaf), Size: src.Size(), ContentType: fs.MimeType(ctx, src), Created: modified, Modified: modified}
+	if o.fs.opt.FlatNamespace && o.info.ID != "" && o.fs.mediaKey(o.info).name == leaf && sameParent(o.info.FolderID, parent) {
+		// Keep numbered copies distinct when replacing their content by media ID.
+		data.Name = o.info.Name
+	}
+
 	o.uploadSource, err = o.chooseUploadSource(ctx, src)
 	if err != nil {
 		return err

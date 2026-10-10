@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -141,7 +142,7 @@ func TestFlatCryptCopySyncCLI(t *testing.T) {
 				for _, name := range names {
 					write(name, "hello "+name)
 				}
-				run := func(args ...string) {
+				run := func(args ...string) string {
 					args = append(args, "--config", configPath, "--cache-dir", cacheDir, "--retries", "1", "--low-level-retries", "1", "--fast-list")
 					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 					defer cancel()
@@ -153,8 +154,35 @@ func TestFlatCryptCopySyncCLI(t *testing.T) {
 					}
 					output, err := child.CombinedOutput()
 					require.NoError(t, err, "%s", output)
+					return string(output)
 				}
 				run("copy", source, "encrypted:")
+				physical, err := flatName(cipher.EncryptFileName(names[0]), false)
+				require.NoError(t, err)
+				fx.mu.Lock()
+				var copyID api.ID
+				for _, item := range fx.media {
+					if item.Name != physical {
+						continue
+					}
+
+					copyID = api.ID(strconv.Itoa(fx.nextID))
+					fx.nextID++
+					fx.content[copyID] = fx.content[item.ID]
+					item.ID, item.Name, item.URL = copyID, physical+" (1)", fx.server.URL+"/content/"+string(copyID)
+					fx.media = append(fx.media, item)
+					break
+				}
+				fx.changes = map[string]api.Changes{"file": {New: []api.ID{copyID}}}
+				fx.mu.Unlock()
+				require.NotEmpty(t, copyID)
+				listed := run("lsf", "encrypted:upload/upload", "--files-only")
+				assert.Equal(t, 2, strings.Count(listed, path.Base(names[0])+"\n"))
+				run("dedupe", "encrypted:", "--dedupe-mode", "rename")
+				for _, name := range []string{"0_thumbnail-1.webp", "0_thumbnail-2.webp"} {
+					assert.Equal(t, "hello "+names[0], run("cat", "encrypted:upload/upload/"+name))
+				}
+
 				write(names[0], "replacement thumbnail")
 				require.NoError(t, os.Remove(filepath.Join(source, filepath.FromSlash(names[2]))))
 				fx.mu.Lock()
